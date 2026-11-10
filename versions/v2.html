@@ -1,0 +1,1236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HANDFRAME v2 — gesture-driven terminals</title>
+<!--
+  HANDFRAME v2
+  ═══════════════════════════════════════════════════════════════════════════
+  MediaPipe HandLandmarker + FaceDetector driving a gesture-controlled
+  terminal workspace.
+
+  RUN IT (webcam needs a real origin):
+      python3 -m http.server 8000
+      http://localhost:8000/handframe-v2.html
+      press CAMERA
+
+  TRACKING NOTES — what changed from v1, and why
+  ---------------------------------------------------------------------------
+  v1 classified gestures from raw normalized landmark distances. That breaks
+  the moment your hand rotates or moves toward/away from the lens. v2 follows
+  the approach in Sridhar/Oulasvirta/Theobalt, "Interactive Markerless
+  Articulated Hand Motion Tracking Using RGB and Depth Data" (MPI):
+
+    * PALM FRAME NORMALIZATION (their §5.2). They segment the palm, fit a
+      plane, and run PCA on the palm point cloud to recover principal
+      directions, so database lookups happen in a canonical frame. We do the
+      2D analogue: PCA over the palm landmarks {0,1,5,9,13,17} gives a palm
+      axis; every landmark is then expressed translation-, rotation- and
+      scale-invariantly in that frame. Every gesture test below runs on those
+      normalized coords, which is why rotating your hand no longer breaks
+      curl detection.
+
+    * JITTER FILTERING (their §5.2 ends with a Kalman filter on orientation).
+      We use a One-Euro filter per coordinate — same job, better suited to
+      interactive latency, adaptive cutoff so slow motion is smoothed hard
+      and fast motion passes through.
+
+    * TEMPORAL EXTRAPOLATION (their Eq. 6). They initialize each optimization
+      step from Θt0 = Θt−1 + α(Θt−1 − Θt−2) with α = 0.5. We apply exactly
+      that to landmark positions to cancel one frame of pipeline latency.
+
+    * HYPOTHESIZE-AND-TEST (their §5.4). Rather than a chain of if-statements,
+      every gesture is a hypothesis scored against the observed pose, with an
+      early-rejection threshold and a best-score winner — their Σ permutation
+      test, reduced to our gesture set.
+
+    * PARTIAL POSE TOLERANCE (their §5). They recover a pose even when some
+      fingers are occluded. Our scorers are weighted averages, not
+      conjunctions, so one mis-tracked finger degrades a score instead of
+      killing the gesture.
+
+  GESTURES
+  ---------------------------------------------------------------------------
+  TWO HANDS  (see §4)
+    FRAME        both hands in an L, diagonal    → create / resize a terminal
+    CORNER_GRAB  same, over an existing terminal → re-grab and resize it
+    PUSH         both palms open, facing camera  → auto-arrange all terminals
+  ONE HAND   (see §3)
+    PINCH        thumb + index tips together     → drag to scale
+    OPEN_PALM    all five out, spread            → expand back to full size
+    C_GRIP       thumb + index apart in a C      → move the terminal
+    FIST         everything curled               → close (hold 0.6s)
+    POINT        index only                      → select next terminal
+    PEACE        index + middle                  → spawn a new terminal
+    THUMB_UP     thumb only, pointing up         → cycle the feed channel
+    MOUTH_COVER  hand over your mouth            → ...you'll see
+
+  HOLD THE FRAME 5 SECONDS to pin a terminal — it detaches from your hands
+  and hovers until you close it. Three or more pinned terminals of similar
+  size auto-arrange into the top-left corner.
+  ═══════════════════════════════════════════════════════════════════════════
+-->
+<style>
+  :root{
+    --bg:#04070a; --panel:rgba(9,16,20,.88); --line:#1c2b33;
+    --ink:#dfeff2; --dim:#6f8a93; --acc:#35e0c0;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);overflow:hidden;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--ink)}
+  #cv{position:fixed;inset:0;width:100%;height:100%;display:block}
+  video{position:fixed;width:2px;height:2px;opacity:0;pointer-events:none;top:0;left:0}
+  #hud{position:fixed;top:14px;left:14px;user-select:none;background:var(--panel);
+    border:1px solid var(--line);padding:11px 13px;width:274px;backdrop-filter:blur(6px)}
+  .ch{display:flex;align-items:baseline;gap:9px;margin-bottom:2px}
+  .ch b{font-size:10px;font-weight:600;letter-spacing:.22em;color:var(--acc)}
+  .ch span{font-size:12px;letter-spacing:.06em}
+  .sub{font-size:8.5px;letter-spacing:.14em;color:var(--dim);
+    border-bottom:1px solid var(--line);padding-bottom:8px;margin-bottom:9px}
+  .row{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:7px}
+  button{background:#0d161b;border:1px solid var(--line);color:var(--ink);
+    font:inherit;font-size:9.5px;letter-spacing:.11em;padding:5px 9px;cursor:pointer}
+  button:hover{border-color:var(--acc)}
+  button.on{background:var(--acc);border-color:var(--acc);color:#04120f}
+  #status{font-size:9px;line-height:1.5;letter-spacing:.03em;margin-bottom:7px;min-height:24px}
+  #tele{display:grid;grid-template-columns:auto 1fr;gap:3px 9px;
+    font-size:8.5px;letter-spacing:.11em;color:var(--dim);align-items:center}
+  #tele s{text-decoration:none;color:var(--ink);font-size:9px}
+  .meter{height:4px;background:var(--line);position:relative;overflow:hidden}
+  .meter i{position:absolute;inset:0;transform-origin:left;transform:scaleX(0);
+    background:var(--acc);display:block}
+  #keys{margin-top:9px;border-top:1px dashed var(--line);padding-top:7px;
+    font-size:8px;line-height:1.7;letter-spacing:.04em;color:var(--dim);
+    max-height:132px;overflow:auto}
+  #keys b{color:var(--ink);font-weight:600}
+</style>
+</head>
+<body>
+<video id="vid" playsinline muted></video>
+<canvas id="cv"></canvas>
+
+<div id="hud">
+  <div class="ch"><b>V2</b><span>HANDFRAME</span></div>
+  <div class="sub">PALM-FRAME TRACKING · GESTURE WORKSPACE</div>
+  <div class="row">
+    <button id="bCam">CAMERA</button>
+    <button id="bSim" class="on">SIM</button>
+    <button id="bSkel">SKELETON</button>
+  </div>
+  <div class="row">
+    <button id="bFeed">FEED: TRACK</button>
+    <button id="bMosaic" class="on">MOSAIC</button>
+    <button id="bClear">CLEAR</button>
+  </div>
+  <div id="status">running SIM — scripted hands, no camera needed.</div>
+  <div id="tele">
+    <span>HANDS</span><s id="tHands">0</s>
+    <span>LEFT</span><s id="tL">—</s>
+    <span>RIGHT</span><s id="tR">—</s>
+    <span>PAIR</span><s id="tPair">—</s>
+    <span>CONF</span><div class="meter"><i id="tConf"></i></div>
+    <span>TERMS</span><s id="tTerms">0</s>
+    <span>FPS</span><s id="tFps">—</s>
+  </div>
+  <div id="keys">
+    <b>FRAME</b> two L hands → new terminal · hold 5s to pin<br>
+    <b>PINCH</b> drag to scale · <b>OPEN PALM</b> restore<br>
+    <b>C-GRIP</b> move · <b>FIST</b> close (hold) · <b>POINT</b> select<br>
+    <b>PEACE</b> new tab · <b>THUMB UP</b> feed · <b>PUSH</b> arrange<br>
+    <b>MOUTH COVER</b> ???
+  </div>
+</div>
+
+<script type="module">
+"use strict";
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §0  CONFIG
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Drop in your own portrait for the easter egg: a local file next to this
+   page ("brunson.jpg"), or any URL. Left null, a vector placeholder renders
+   instead — no likeness is shipped with this file. */
+const PORTRAIT_SRC = null;
+
+const TERM = {
+  bg:      "#0a34d6",   // bright blue, kitty-ish
+  bgAlpha: 0.90,
+  fg:      "#39ff5a",   // bright green
+  dim:     "#1fbf46",
+  hot:     "#b6ffc4",
+  warn:    "#ffd84a",
+  border:  "rgba(57,255,90,0.55)",
+};
+const DEFAULT_W = 560, DEFAULT_H = 340;
+const PIN_HOLD  = 5.0;     // seconds of held FRAME before a terminal pins
+const FIST_HOLD = 0.6;     // seconds of FIST before a close commits
+const DOCK_MIN  = 3;       // terminals needed before auto-arrange kicks in
+
+const G = {                 // gesture ids
+  NONE:"NONE", L_CORNER:"L_CORNER", PINCH:"PINCH", OPEN_PALM:"OPEN_PALM",
+  C_GRIP:"C_GRIP", FIST:"FIST", POINT:"POINT", PEACE:"PEACE",
+  THUMB_UP:"THUMB_UP", MOUTH_COVER:"MOUTH_COVER",
+};
+const PAIR = { NONE:"NONE", FRAME:"FRAME", CORNER_GRAB:"CORNER_GRAB", PUSH:"PUSH" };
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §1  MATH & FILTERS
+   ═══════════════════════════════════════════════════════════════════════════ */
+const clamp = (v,a,b)=> v<a?a:v>b?b:v;
+const lerp  = (a,b,t)=> a+(b-a)*t;
+const dist2 = (a,b)=> Math.hypot(a.x-b.x, a.y-b.y);
+const sub   = (a,b)=> ({x:a.x-b.x, y:a.y-b.y});
+const norm  = v => { const l=Math.hypot(v.x,v.y)||1; return {x:v.x/l, y:v.y/l}; };
+const dot   = (a,b)=> a.x*b.x + a.y*b.y;
+/* unsigned angle between two vectors, 0..π */
+const angBetween = (a,b)=> Math.acos(clamp(dot(norm(a),norm(b)), -1, 1));
+/* soft membership: 1 inside [lo,hi], falling off over `soft` on each side */
+function band(v, lo, hi, soft){
+  if(v >= lo && v <= hi) return 1;
+  const d = v < lo ? lo - v : v - hi;
+  return clamp(1 - d/soft, 0, 1);
+}
+
+/* One-Euro filter. Stands in for the Kalman filter the paper uses to damp
+   orientation jitter (§5.2): adaptive cutoff means a still hand is smoothed
+   heavily while a fast one stays responsive. */
+class OneEuro {
+  constructor(minCutoff=1.4, beta=0.012, dCutoff=1.0){
+    this.mc = minCutoff; this.beta = beta; this.dc = dCutoff;
+    this.x = null; this.dx = 0;
+  }
+  static alpha(cutoff, dt){ const tau = 1/(2*Math.PI*cutoff); return 1/(1 + tau/dt); }
+  filter(x, dt){
+    if(this.x === null){ this.x = x; return x; }
+    const dx = (x - this.x)/dt;
+    const ad = OneEuro.alpha(this.dc, dt);
+    this.dx = ad*dx + (1-ad)*this.dx;
+    const cutoff = this.mc + this.beta*Math.abs(this.dx);
+    const a = OneEuro.alpha(cutoff, dt);
+    this.x = a*x + (1-a)*this.x;
+    return this.x;
+  }
+}
+
+/* 2D PCA — the planar analogue of the paper's palm-orientation PCA (§5.2). */
+function pca2(pts){
+  let cx=0, cy=0;
+  for(const p of pts){ cx+=p.x; cy+=p.y; }
+  cx/=pts.length; cy/=pts.length;
+  let sxx=0, syy=0, sxy=0;
+  for(const p of pts){
+    const dx=p.x-cx, dy=p.y-cy;
+    sxx+=dx*dx; syy+=dy*dy; sxy+=dx*dy;
+  }
+  const n = pts.length;
+  sxx/=n; syy/=n; sxy/=n;
+  const tr = sxx+syy, det = sxx*syy - sxy*sxy;
+  const disc = Math.max(0, tr*tr/4 - det);
+  const l1 = tr/2 + Math.sqrt(disc), l2 = tr/2 - Math.sqrt(disc);
+  let ax;
+  if(Math.abs(sxy) > 1e-12) ax = norm({x: l1 - syy, y: sxy});
+  else ax = sxx >= syy ? {x:1,y:0} : {x:0,y:1};
+  return { c:{x:cx,y:cy}, axis:ax, l1, l2, aniso: l1/Math.max(l2,1e-9) };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §2  HAND MODEL — raw landmarks → filtered, palm-normalized feature vector
+   ═══════════════════════════════════════════════════════════════════════════ */
+const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[0,9],[9,10],[10,11],
+  [11,12],[0,13],[13,14],[14,15],[15,16],[0,17],[17,18],[18,19],[19,20],
+  [5,9],[9,13],[13,17],[2,5]];
+const CHAINS = [[1,2,3,4],[5,6,7,8],[9,10,11,12],[13,14,15,16],[17,18,19,20]];
+const TIPS = [4,8,12,16,20];
+const PALM_IDX = [0,1,5,9,13,17];
+const EXTRAP_ALPHA = 0.5;    // paper Eq. 6
+
+class HandState {
+  constructor(id){
+    this.id = id;
+    this.fx = Array.from({length:21}, ()=> new OneEuro());
+    this.fy = Array.from({length:21}, ()=> new OneEuro());
+    this.prev = null; this.prev2 = null;
+    this.gest = G.NONE; this.gestScore = 0;
+    this.candidate = G.NONE; this.candT = 0;
+    this.lost = 99;
+  }
+
+  /* lm: raw MediaPipe landmarks. mirror/AR put us in display orientation so
+     every angle below matches what the user sees on screen. */
+  update(lm, dt, mirror, AR){
+    const raw = lm.map(p => ({
+      x: (mirror ? 1 - p.x : p.x) * AR,
+      y: p.y,
+      z: p.z || 0,
+    }));
+    // 1. per-coordinate One-Euro
+    const f = raw.map((p,i)=> ({
+      x: this.fx[i].filter(p.x, dt),
+      y: this.fy[i].filter(p.y, dt),
+      z: p.z,
+    }));
+    // 2. temporal extrapolation, paper Eq. 6 — cancels a frame of latency
+    let p = f;
+    if(this.prev && this.prev2){
+      p = f.map((q,i)=> ({
+        x: q.x + EXTRAP_ALPHA*(this.prev[i].x - this.prev2[i].x)*0.5,
+        y: q.y + EXTRAP_ALPHA*(this.prev[i].y - this.prev2[i].y)*0.5,
+        z: q.z,
+      }));
+    }
+    this.prev2 = this.prev; this.prev = f;
+    this.m = p;                                   // metric-space landmarks
+
+    // 3. palm frame via PCA over the palm landmarks
+    const palmPts = PALM_IDX.map(i => p[i]);
+    const pc = pca2(palmPts);
+    this.palm = pc;
+    this.span = Math.max(1e-6, dist2(p[0], p[9]));  // wrist → middle MCP
+    // orient the axis wrist→middle-MCP so the palm angle is unambiguous
+    const fwd = norm(sub(p[9], p[0]));
+    const sgn = dot(pc.axis, fwd) < 0 ? -1 : 1;
+    this.axis = { x: pc.axis.x*sgn, y: pc.axis.y*sgn };
+    this.angle = Math.atan2(this.axis.y, this.axis.x);
+
+    // 4. normalized coords: translate to wrist, rotate by −palmAngle, /span
+    const ca = Math.cos(-this.angle), sa = Math.sin(-this.angle);
+    this.n = p.map(q => {
+      const dx = (q.x - p[0].x)/this.span, dy = (q.y - p[0].y)/this.span;
+      return { x: ca*dx - sa*dy, y: sa*dx + ca*dy };
+    });
+
+    // 5. per-finger curl from joint angles (rotation/scale invariant)
+    this.curl = CHAINS.map(ch => {
+      const a = sub(this.n[ch[1]], this.n[ch[0]]);
+      const b = sub(this.n[ch[3]], this.n[ch[2]]);
+      return clamp(angBetween(a,b) / (Math.PI*0.82), 0, 1);
+    });
+    this.ext = this.curl.map(c => 1 - c);          // extension 0..1
+
+    // 6. scalar features every gesture scorer reads
+    const tipC = { x:0, y:0 };
+    for(const t of TIPS){ tipC.x += this.n[t].x; tipC.y += this.n[t].y; }
+    tipC.x /= 5; tipC.y /= 5;
+    let gather = 0;
+    for(const t of TIPS) gather += dist2(this.n[t], tipC);
+    this.f = {
+      pinch:   dist2(this.n[4], this.n[8]),        // thumb↔index tip
+      gather:  gather/5,                            // mean tip spread
+      spread:  dist2(this.n[8], this.n[20]),        // index↔pinky tip
+      thumbIdxAng: angBetween(sub(this.n[4],this.n[2]), sub(this.n[8],this.n[5])),
+      aniso:   pc.aniso,
+    };
+
+    // 7. screen-space anchors (filled by the renderer's fit)
+    this.centroidM = { x:(p[0].x + p[9].x)/2, y:(p[0].y + p[9].y)/2 };
+    this.lost = 0;
+  }
+
+  /* commit a classification only after it persists — kills single-frame flicker */
+  settle(g, score, dt, need=0.10){
+    if(g === this.candidate){ this.candT += dt; }
+    else { this.candidate = g; this.candT = 0; }
+    if(this.candT >= need || g === this.gest){
+      this.gest = g; this.gestScore = score;
+    }
+    return this.gest;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §3  SINGLE-HAND TRACKING
+   Every gesture is a hypothesis with a score in [0,1] (paper §5.4). Weighted
+   averages rather than hard conjunctions, so an occluded finger degrades the
+   score instead of vetoing the pose.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const REJECT = 0.55;     // early-rejection threshold, analogous to their µ
+
+const SINGLE = [
+  { id: G.PINCH, score(h){
+      const near  = band(h.f.pinch, 0, 0.34, 0.24);       // tips touching
+      const others= (h.curl[2]+h.curl[3]+h.curl[4])/3;
+      return 0.62*near + 0.20*clamp(others*1.4,0,1) + 0.18*band(h.f.gather,0,0.55,0.35);
+    }},
+  { id: G.OPEN_PALM, score(h){
+      const open = (h.ext[0]+h.ext[1]+h.ext[2]+h.ext[3]+h.ext[4])/5;
+      return 0.60*clamp((open-0.45)/0.45,0,1) + 0.40*band(h.f.spread, 0.85, 3.0, 0.45);
+    }},
+  /* C_GRIP vs L_CORNER: thumb-to-index ANGLE alone can't separate these — hand
+     shape and camera foreshortening move it too much. The reliable cue is the
+     index itself. Curling into a C bends it; holding an L keeps it rigid. */
+  { id: G.C_GRIP, score(h){
+      const curve = band(h.curl[1], 0.16, 0.70, 0.20);      // index bowed, not straight
+      const gap   = band(h.f.pinch, 0.42, 1.40, 0.28);      // apart, not pinched shut
+      const arc   = band(h.f.thumbIdxAng, 0.12, 1.10, 0.34);
+      const rest  = (h.curl[2]+h.curl[3]+h.curl[4])/3;
+      const base  = 0.30*curve + 0.16*h.ext[0] + 0.20*gap + 0.16*arc + 0.18*clamp(rest*1.3,0,1);
+      return base * (0.35 + 0.65*curve);   // no bow in the index, no C
+    }},
+  { id: G.L_CORNER, score(h){
+      const rigid = Math.min(h.ext[0], h.ext[1]);           // BOTH dead straight
+      const perp  = band(h.f.thumbIdxAng, 0.42, 2.20, 0.34);
+      const rest  = (h.curl[2]+h.curl[3]+h.curl[4])/3;
+      return 0.40*clamp((rigid - 0.55)/0.42, 0, 1) + 0.28*perp + 0.32*clamp(rest*1.3,0,1);
+    }},
+  { id: G.FIST, score(h){
+      const four = (h.curl[1]+h.curl[2]+h.curl[3]+h.curl[4])/4;
+      const base = 0.55*clamp((four-0.42)/0.45,0,1) + 0.20*clamp(h.curl[0]*1.4,0,1)
+                 + 0.25*band(h.f.gather, 0, 0.62, 0.30);
+      // a jutting thumb means it's a thumbs-up or an L, not a fist
+      return base * (1 - 0.45*clamp((h.ext[0]-0.55)/0.35, 0, 1));
+    }},
+  { id: G.POINT, score(h){
+      const rest = (h.curl[2]+h.curl[3]+h.curl[4])/3;
+      return 0.42*h.ext[1] + 0.34*clamp(rest*1.3,0,1) + 0.24*h.curl[0];
+    }},
+  { id: G.PEACE, score(h){
+      const rest = (h.curl[3]+h.curl[4])/2;
+      const v = band(dist2(h.n[8], h.n[12]), 0.28, 1.2, 0.28);
+      return 0.28*h.ext[1] + 0.28*h.ext[2] + 0.26*clamp(rest*1.3,0,1) + 0.18*v;
+    }},
+  { id: G.THUMB_UP, score(h){
+      // direction is definitional here, so it gates rather than merely scores
+      const up = clamp(-(h.m[4].y - h.m[0].y)/Math.max(h.span,1e-6), 0, 1.4)/1.4;
+      if(up < 0.34) return 0;
+      const rest = (h.curl[1]+h.curl[2]+h.curl[3]+h.curl[4])/4;
+      return 0.30*h.ext[0] + 0.34*clamp(rest*1.25,0,1) + 0.36*up;
+    }},
+];
+
+/* hypothesize-and-test: score every candidate, reject below threshold, keep best */
+function classifySingle(h, dt, faceBox){
+  // MOUTH_COVER is contextual — it needs the face box, so it's tested first
+  if(faceBox){
+    const c = h.centroidM;
+    const inX = c.x > faceBox.x - faceBox.w*0.30 && c.x < faceBox.x + faceBox.w*1.30;
+    const lowY = faceBox.y + faceBox.h*0.34;
+    const inY = c.y > lowY - faceBox.h*0.18 && c.y < faceBox.y + faceBox.h*1.45;
+    if(inX && inY){
+      const nearMouth = 1 - clamp(Math.abs(c.y - (faceBox.y + faceBox.h*0.78))/(faceBox.h*0.75), 0, 1);
+      const upright   = band(Math.abs(h.angle), 0.55, Math.PI - 0.55, 0.9);
+      const s = 0.55*nearMouth + 0.25*upright + 0.20*band(h.f.gather, 0.18, 1.5, 0.5);
+      if(s >= REJECT) return { g: h.settle(G.MOUTH_COVER, s, dt, 0.30), s };
+    }
+  }
+  let best = G.NONE, bs = 0;
+  for(const cand of SINGLE){
+    const s = cand.score(h);
+    if(s < REJECT) continue;                 // early rejection
+    if(s > bs){ bs = s; best = cand.id; }
+  }
+  if(best === G.NONE){ h.settle(G.NONE, 0, dt, 0.06); return { g:G.NONE, s:0 }; }
+  return { g: h.settle(best, bs, dt), s: bs };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §4  MULTI-HAND TRACKING
+   Two-hand poses are classified separately: they need relative geometry
+   (corner diagonal, palm facing) that single-hand features can't express.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const cornerOf = h => ({ x:(h.m[2].x + h.m[5].x)/2, y:(h.m[2].y + h.m[5].y)/2 });
+
+function classifyPair(hands, dt, state){
+  if(hands.length < 2){ state.pair = PAIR.NONE; state.pairT = 0; return state; }
+  const [a, b] = hands;
+
+  // FRAME / CORNER_GRAB — both hands holding an L, corners on a diagonal
+  const lA = SINGLE.find(s=>s.id===G.L_CORNER).score(a);
+  const lB = SINGLE.find(s=>s.id===G.L_CORNER).score(b);
+  if(lA >= REJECT && lB >= REJECT){
+    const ca = cornerOf(a), cb = cornerOf(b);
+    const w = Math.abs(ca.x - cb.x), h2 = Math.abs(ca.y - cb.y);
+    // require a real rectangle, not two hands stacked on one axis
+    if(w > 0.16 && h2 > 0.11){
+      state.pair = PAIR.FRAME;
+      state.pairScore = (lA + lB)/2;
+      state.corners = ca.x <= cb.x ? [ca, cb] : [cb, ca];
+      // tilt from the top edge = index direction of the hand at the left corner
+      const lh = ca.x <= cb.x ? a : b;
+      state.tilt = clamp(Math.atan2(lh.m[8].y - lh.m[5].y, lh.m[8].x - lh.m[5].x)*0.55, -0.26, 0.26);
+      state.pairT += dt;
+      return state;
+    }
+  }
+
+  // PUSH — both palms open and facing the camera
+  const oA = SINGLE.find(s=>s.id===G.OPEN_PALM).score(a);
+  const oB = SINGLE.find(s=>s.id===G.OPEN_PALM).score(b);
+  if(oA >= REJECT && oB >= REJECT && Math.abs(a.centroidM.y - b.centroidM.y) < 0.30){
+    state.pair = PAIR.PUSH; state.pairScore = (oA+oB)/2; state.pairT += dt;
+    return state;
+  }
+
+  state.pair = PAIR.NONE; state.pairT = 0; state.pairScore = 0;
+  return state;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §5  TERMINALS
+   ═══════════════════════════════════════════════════════════════════════════ */
+let termSeq = 0;
+class Terminal {
+  constructor(rect, kind="SHELL"){
+    this.id = ++termSeq;
+    this.r  = { ...rect };
+    this.t  = { ...rect };          // animation target
+    this.kind = kind;               // SHELL | INFO
+    this.open = 0; this.target = 1;
+    this.pinned = false; this.holdT = 0; this.lossT = 0;
+    this.tilt = 0; this.tiltT = 0;
+    this.docked = false;
+    this.log = []; this.acc = 0; this.born = performance.now();
+    this.feed = 0;
+    this.closing = false; this.fistT = 0;
+    this.grab = null;               // active manipulation context
+  }
+  get cx(){ return this.r.x + this.r.w/2; }
+  get cy(){ return this.r.y + this.r.h/2; }
+  contains(p, pad=70){
+    return p.x > this.r.x - pad && p.x < this.r.x + this.r.w + pad &&
+           p.y > this.r.y - pad && p.y < this.r.y + this.r.h + pad;
+  }
+  push(line){
+    this.log.push(line);
+    if(this.log.length > 400) this.log.splice(0, this.log.length - 400);
+  }
+  step(dt){
+    const k = Math.min(1, dt*(this.docked ? 7 : 11));
+    for(const key of ["x","y","w","h"]) this.r[key] = lerp(this.r[key], this.t[key], k);
+    this.tilt = lerp(this.tilt, this.tiltT, Math.min(1, dt*6));
+    this.open = lerp(this.open, this.closing ? 0 : this.target, Math.min(1, dt*(this.target?9:11)));
+  }
+}
+const terms = [];
+let activeId = null;
+
+const activeTerm = ()=> terms.find(t => t.id === activeId) || null;
+function nearestTerm(p){
+  let best = null, bd = 1e9;
+  for(const t of terms){
+    if(!t.pinned || t.closing) continue;
+    const d = Math.hypot(p.x - t.cx, p.y - t.cy);
+    if(d < bd){ bd = d; best = t; }
+  }
+  return best;
+}
+
+/* Auto-arrange: 3+ pinned terminals of comparable size cascade into the
+   top-left, Stark-desktop style. */
+function arrange(force){
+  const pool = terms.filter(t => t.pinned && !t.closing && t.kind === "SHELL");
+  if(pool.length < DOCK_MIN && !force){
+    for(const t of terms) t.docked = false;
+    return;
+  }
+  const areas = pool.map(t => t.t.w * t.t.h);
+  const med = areas.slice().sort((a,b)=>a-b)[Math.floor(areas.length/2)];
+  const similar = pool.filter((t,i)=> Math.abs(areas[i] - med)/med < 0.45);
+  if(similar.length < DOCK_MIN && !force) return;
+
+  const w = Math.min(DEFAULT_W, W*0.40), h = Math.min(DEFAULT_H, H*0.42);
+  const ox = 306, oy = 22, dx = 30, dy = 26;
+  similar.forEach((t, i)=>{
+    t.docked = true;
+    t.t = { x: ox + i*dx, y: oy + i*dy, w, h };
+    t.tiltT = 0;
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §6  TELEMETRY FEED — the terminal prints the tracker's own state
+   ═══════════════════════════════════════════════════════════════════════════ */
+const FEEDS = ["TRACK", "GEST", "KINE"];
+const fmt = (v, n=3)=> (v<0?"":" ") + v.toFixed(n);
+const bar = (v, n=10)=> "█".repeat(clamp(Math.round(v*n),0,n)).padEnd(n, "·");
+
+function feedLines(t, hands, pair, time){
+  const out = [];
+  const h = hands[0];
+  if(!h){
+    out.push({ s:"  waiting for landmarks …", c:TERM.dim });
+    return out;
+  }
+  const stamp = "[" + (time).toFixed(3).padStart(8) + "]";
+  if(FEEDS[t.feed] === "TRACK"){
+    out.push({ s:`${stamp} hand=${h.id} conf=${h.gestScore.toFixed(2)} gesture=${h.gest}`, c:TERM.fg });
+    out.push({ s:`  wrist   x=${fmt(h.m[0].x)} y=${fmt(h.m[0].y)} z=${fmt(h.m[0].z)}`, c:TERM.dim });
+    out.push({ s:`  palm    θ=${(h.angle*180/Math.PI).toFixed(1).padStart(6)}°  span=${fmt(h.span)}  λ1/λ2=${h.f.aniso.toFixed(2)}`, c:TERM.dim });
+    out.push({ s:`  curl    T${bar(h.curl[0],6)} I${bar(h.curl[1],6)} M${bar(h.curl[2],6)}`, c:TERM.fg });
+    out.push({ s:`          R${bar(h.curl[3],6)} P${bar(h.curl[4],6)}`, c:TERM.fg });
+    out.push({ s:`  tips    pinch=${fmt(h.f.pinch)} gather=${fmt(h.f.gather)} spread=${fmt(h.f.spread)}`, c:TERM.dim });
+  } else if(FEEDS[t.feed] === "GEST"){
+    out.push({ s:`${stamp} hypothesize-and-test  µ=${REJECT.toFixed(2)}`, c:TERM.fg });
+    const scored = SINGLE.map(c => ({ id:c.id, s:c.score(h) })).sort((a,b)=>b.s-a.s);
+    for(const c of scored.slice(0,5)){
+      const passed = c.s >= REJECT;
+      out.push({ s:`  ${(c.s>=REJECT?"✓":"×")} ${c.id.padEnd(10)} ${c.s.toFixed(3)} ${bar(c.s,14)}`,
+                 c: passed ? (c.id===h.gest?TERM.hot:TERM.fg) : TERM.dim });
+    }
+    out.push({ s:`  → committed ${h.gest}  pair=${pair}`, c:TERM.warn });
+  } else {
+    out.push({ s:`${stamp} kinematics`, c:TERM.fg });
+    out.push({ s:`  one-euro  mc=1.40 β=0.012  dcut=1.00`, c:TERM.dim });
+    out.push({ s:`  extrap    Θt0 = Θt-1 + α(Θt-1 - Θt-2)   α=${EXTRAP_ALPHA.toFixed(2)}`, c:TERM.dim });
+    out.push({ s:`  palm pca  axis=(${fmt(h.axis.x,2)},${fmt(h.axis.y,2)}) aniso=${h.f.aniso.toFixed(2)}`, c:TERM.fg });
+    const dofs = h.curl.map((c,i)=> `${["T","I","M","R","P"][i]}=${(c*90).toFixed(0).padStart(2)}°`).join(" ");
+    out.push({ s:`  joints    ${dofs}`, c:TERM.fg });
+    out.push({ s:`  frame     ${(1000/Math.max(1,dtms)).toFixed(0)} fps  latency≈${dtms.toFixed(1)}ms`, c:TERM.dim });
+  }
+  return out;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §7  BRUNSON CARD  (facts verified; no likeness shipped — see PORTRAIT_SRC)
+   ═══════════════════════════════════════════════════════════════════════════ */
+const BRUNSON = [
+  { s:"gesture: MOUTH_COVER    match: brunson_three", c:TERM.warn },
+  { s:"", c:TERM.fg },
+  { s:"Jalen Brunson — point guard, New York Knicks.", c:TERM.hot },
+  { s:"2026 NBA Finals MVP, unanimous (11/11 votes),", c:TERM.fg },
+  { s:"after 45 in the Game 5 closeout at San Antonio", c:TERM.fg },
+  { s:"— tying Jordan for most in a title clincher", c:TERM.fg },
+  { s:"on the road.", c:TERM.fg },
+  { s:"", c:TERM.fg },
+  { s:"The gesture is his three-point celebration:", c:TERM.dim },
+  { s:"hand to the face, three fingers wagging. He", c:TERM.dim },
+  { s:"stonewalled sideline reporters about it for a", c:TERM.dim },
+  { s:"year — \"Don't worry about it\" — which only", c:TERM.dim },
+  { s:"convinced everyone it meant something.", c:TERM.dim },
+  { s:"", c:TERM.fg },
+  { s:"It doesn't. He eventually admitted it has", c:TERM.fg },
+  { s:"\"no meaning other than three points on the", c:TERM.hot },
+  { s:"board\" — he kept it because nobody else", c:TERM.hot },
+  { s:"was doing it.", c:TERM.hot },
+  { s:"", c:TERM.fg },
+];
+let portrait = null;
+if(PORTRAIT_SRC){
+  portrait = new Image();
+  portrait.crossOrigin = "anonymous";
+  portrait.src = PORTRAIT_SRC;
+}
+/* vector stand-in: a jersey, not a likeness */
+function drawPortraitPlaceholder(g, x, y, w, h){
+  const s = Math.min(w/120, h/120);
+  g.save();
+  g.translate(x + w/2, y);
+  g.scale(s, s);
+  g.fillStyle = "#f58426";                                  // shoulders
+  g.beginPath();
+  g.moveTo(-42, 118); g.lineTo(-34, 44); g.lineTo(-16, 34);
+  g.lineTo(16, 34);   g.lineTo(34, 44);  g.lineTo(42, 118);
+  g.closePath(); g.fill();
+  g.fillStyle = "#f2f4f7";                                  // jersey
+  g.beginPath();
+  g.moveTo(-30, 118); g.lineTo(-24, 50); g.lineTo(-10, 40);
+  g.lineTo(10, 40);   g.lineTo(24, 50);  g.lineTo(30, 118);
+  g.closePath(); g.fill();
+  g.fillStyle = "#1d6ac4";                                  // number
+  g.font = "bold 42px ui-monospace, monospace";
+  g.textAlign = "center";
+  g.fillText("11", 0, 100);
+  g.fillStyle = "#3a2a22";                                  // head + hand
+  g.beginPath(); g.arc(0, 14, 21, 0, 7); g.fill();
+  g.fillStyle = "#4a352b";
+  g.beginPath(); g.ellipse(4, 24, 13, 9, -0.25, 0, 7); g.fill();
+  g.restore();
+  g.textAlign = "left";
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §8  STAGE / RENDER
+   ═══════════════════════════════════════════════════════════════════════════ */
+const cv = document.getElementById("cv"), g = cv.getContext("2d");
+const vid = document.getElementById("vid");
+const $ = id => document.getElementById(id);
+const bgSmall = document.createElement("canvas");
+const bgCtx = bgSmall.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+function resize(){
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = Math.floor(W*DPR); cv.height = Math.floor(H*DPR);
+  g.setTransform(DPR,0,0,DPR,0,0);
+}
+addEventListener("resize", resize);
+resize();
+
+let mode = "sim", showSkel = true, mosaic = true;
+let landmarker = null, faceDet = null, cachedHands = [], faceBox = null;
+let lastVideoTime = -1, faceTick = 0, dtms = 16;
+let AR = 16/9;
+const handStates = [new HandState("A"), new HandState("B")];
+const pairState = { pair:PAIR.NONE, pairT:0, pairScore:0, corners:null, tilt:0 };
+
+function drawBackground(fit, mosaicAmt){
+  if(mode === "cam" && vid.readyState >= 2){
+    if(mosaicAmt > 0.02 && mosaic){
+      const px = lerp(1, 22, mosaicAmt);
+      const sw = Math.max(2, Math.round(W/px)), sh = Math.max(2, Math.round(H/px));
+      bgSmall.width = sw; bgSmall.height = sh;
+      bgCtx.save(); bgCtx.scale(-1, 1);
+      bgCtx.drawImage(vid, -(fit.ox + fit.dw)/px, fit.oy/px, fit.dw/px, fit.dh/px);
+      bgCtx.restore();
+      g.save();
+      g.imageSmoothingEnabled = false;
+      g.filter = `blur(${(mosaicAmt*3.2).toFixed(1)}px)`;
+      g.drawImage(bgSmall, 0, 0, W, H);
+      g.restore();
+    } else {
+      g.save(); g.scale(-1, 1);
+      g.drawImage(vid, -(fit.ox + fit.dw), fit.oy, fit.dw, fit.dh);
+      g.restore();
+    }
+    g.fillStyle = `rgba(4,7,10,${0.40 + 0.22*mosaicAmt})`;
+    g.fillRect(0, 0, W, H);
+  } else {
+    g.fillStyle = "#04070a"; g.fillRect(0, 0, W, H);
+    g.strokeStyle = "rgba(28,43,51,0.5)"; g.lineWidth = 1;
+    g.beginPath();
+    for(let x = 0; x < W; x += 64){ g.moveTo(x, 0); g.lineTo(x, H); }
+    for(let y = 0; y < H; y += 64){ g.moveTo(0, y); g.lineTo(W, y); }
+    g.stroke();
+  }
+}
+
+function drawHand(h, pts, tag){
+  g.lineWidth = 1;
+  g.strokeStyle = tag ? "rgba(57,255,90,0.7)" : "rgba(223,239,242,0.42)";
+  g.beginPath();
+  for(const [a,b] of BONES){ g.moveTo(pts[a].x, pts[a].y); g.lineTo(pts[b].x, pts[b].y); }
+  g.stroke();
+  for(let i = 0; i < 21; i++){
+    const p = pts[i], isTip = TIPS.includes(i);
+    if(isTip){
+      g.shadowBlur = 9; g.shadowColor = tag ? "#39ff5a" : "#dfeff2";
+      g.fillStyle = tag ? "#b6ffc4" : "#ffffff";
+      g.beginPath(); g.arc(p.x, p.y, 3, 0, 7); g.fill();
+      g.shadowBlur = 0;
+    } else {
+      g.fillStyle = tag ? "rgba(57,255,90,0.8)" : "rgba(223,239,242,0.6)";
+      g.beginPath(); g.arc(p.x, p.y, 1.6, 0, 7); g.fill();
+    }
+  }
+  // palm axis from the PCA frame
+  const w = pts[0], sp = Math.hypot(pts[9].x - pts[0].x, pts[9].y - pts[0].y);
+  g.strokeStyle = "rgba(53,224,192,0.5)";
+  g.beginPath(); g.arc(w.x, w.y, 15, 0, 7); g.stroke();
+  g.beginPath();
+  g.moveTo(w.x, w.y);
+  g.lineTo(w.x + Math.cos(h.angle)*sp*1.25, w.y + Math.sin(h.angle)*sp*1.25);
+  g.stroke();
+  if(tag){
+    g.fillStyle = "#39ff5a";
+    g.font = "9px ui-monospace, monospace";
+    g.fillText(tag, pts[0].x + 18, pts[0].y + 4);
+  }
+}
+
+function drawTerminal(t, now){
+  if(t.open < 0.01) return;
+  const r = t.r, o = t.open;
+  const hh = r.h * o;
+  g.save();
+  g.translate(r.x + r.w/2, r.y + r.h/2);
+  g.rotate(t.tilt);
+  g.translate(-r.w/2, -hh/2);
+
+  // body — flat blue, 90% opacity, no titlebar
+  g.globalAlpha = TERM.bgAlpha * Math.min(1, o*1.4);
+  g.fillStyle = TERM.bg;
+  g.fillRect(0, 0, r.w, hh);
+  g.globalAlpha = 1;
+  g.strokeStyle = t.id === activeId ? TERM.fg : TERM.border;
+  g.lineWidth = t.id === activeId ? 1.5 : 1;
+  g.strokeRect(0.5, 0.5, r.w - 1, hh - 1);
+
+  if(o > 0.5){
+    const fs  = clamp(r.w/58, 9, 17);
+    const pad = fs*0.85, lh = fs*1.30;
+    g.save();
+    g.beginPath(); g.rect(2, 2, r.w - 4, hh - 4); g.clip();
+    g.font = fs + "px ui-monospace, monospace";
+    const cw = g.measureText("M").width;
+    const rows = Math.max(1, Math.floor((hh - pad*1.6)/lh));
+
+    if(t.kind === "INFO"){
+      const textRows = Math.min(BRUNSON.length, rows - 7);
+      BRUNSON.slice(0, Math.max(0, textRows)).forEach((ln, i)=>{
+        g.fillStyle = ln.c;
+        g.fillText(ln.s, pad, pad + (i+1)*lh);
+      });
+      const py = pad + (Math.max(0,textRows)+1)*lh;
+      const ph = Math.max(0, hh - py - pad);
+      if(ph > 30){
+        const pw = ph*0.9;
+        if(portrait && portrait.complete && portrait.naturalWidth){
+          g.drawImage(portrait, pad, py, pw, ph);
+        } else {
+          drawPortraitPlaceholder(g, pad, py, pw, ph);
+          g.fillStyle = TERM.dim;
+          g.font = (fs*0.8) + "px ui-monospace, monospace";
+          g.fillText("[ set PORTRAIT_SRC to drop in a photo ]", pad + pw + pad, py + ph/2);
+        }
+      }
+    } else {
+      const vis = t.log.slice(-rows);
+      vis.forEach((ln, i)=>{
+        g.fillStyle = ln.c;
+        g.fillText(ln.s, pad, pad + (i+1)*lh);
+      });
+      const last = vis[vis.length-1];
+      if((now % 1000) < 540){
+        g.fillStyle = TERM.fg;
+        const x = pad + ((last ? last.s.length : 0) + 1)*cw;
+        g.fillRect(x, pad + vis.length*lh - fs*0.82, cw*0.85, fs*0.95);
+      }
+    }
+    g.restore();
+  } else {
+    g.fillStyle = TERM.fg;
+    g.fillRect(0, hh/2 - 1, r.w, 2);
+  }
+  g.restore();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §9  INTERACTION — wire gestures to terminal operations
+   ═══════════════════════════════════════════════════════════════════════════ */
+let liveTerm = null;      // the un-pinned terminal currently bound to a frame
+
+function applyPair(fit, dt, time){
+  if(pairState.pair === PAIR.FRAME && pairState.corners){
+    const [a, b] = pairState.corners;
+    const A = toScreen(a, fit), B = toScreen(b, fit);
+    const rect = {
+      x: Math.min(A.x, B.x), y: Math.min(A.y, B.y),
+      w: Math.abs(A.x - B.x), h: Math.abs(A.y - B.y),
+    };
+    if(rect.w < 130 || rect.h < 90) return;
+
+    // if the frame lands on an existing pinned terminal, grab it instead
+    const hit = terms.find(t => t.pinned && !t.closing && t.kind === "SHELL" &&
+      Math.hypot(rect.x + rect.w/2 - t.cx, rect.y + rect.h/2 - t.cy) < Math.max(t.r.w, t.r.h)*0.75);
+    const target = hit || liveTerm;
+
+    if(target){
+      target.t = rect; target.tiltT = pairState.tilt; target.target = 1;
+      target.closing = false; target.lossT = 0;
+      if(hit){ hit.docked = false; activeId = hit.id; }
+      else {
+        target.holdT += dt;
+        if(target.holdT >= PIN_HOLD && !target.pinned){ target.pinned = true; liveTerm = null; arrange(); }
+      }
+    } else {
+      const t = new Terminal(rect);
+      t.tiltT = pairState.tilt;
+      terms.push(t); liveTerm = t; activeId = t.id;
+    }
+  } else if(pairState.pair === PAIR.PUSH){
+    if(pairState.pairT > 0.45){ arrange(true); pairState.pairT = 0; }
+  } else if(liveTerm){
+    liveTerm.lossT += dt;
+    if(liveTerm.lossT > 0.40){
+      liveTerm.closing = true;
+      if(liveTerm.open < 0.02){
+        const i = terms.indexOf(liveTerm);
+        if(i >= 0) terms.splice(i, 1);
+        liveTerm = null;
+      }
+    }
+  }
+}
+
+function applySingle(h, fit, dt){
+  const p = toScreen(h.centroidM, fit);
+  let t = nearestTerm(p);
+
+  switch(h.gest){
+    case G.PEACE: {
+      if(h.candT > 0.45 && !h._spawned){
+        h._spawned = true;
+        const nt = new Terminal({ x: clamp(p.x - DEFAULT_W/2, 12, W - DEFAULT_W - 12),
+                                  y: clamp(p.y - DEFAULT_H/2, 12, H - DEFAULT_H - 12),
+                                  w: DEFAULT_W, h: DEFAULT_H });
+        nt.pinned = true;
+        terms.push(nt); activeId = nt.id; arrange();
+      }
+      break;
+    }
+    case G.POINT: {
+      if(h.candT > 0.5 && !h._cycled){
+        h._cycled = true;
+        const pool = terms.filter(x => x.pinned && !x.closing);
+        if(pool.length){
+          const i = pool.findIndex(x => x.id === activeId);
+          activeId = pool[(i + 1) % pool.length].id;
+        }
+      }
+      break;
+    }
+    case G.THUMB_UP: {
+      if(h.candT > 0.5 && !h._feed){
+        h._feed = true;
+        const at = activeTerm();
+        if(at){ at.feed = (at.feed + 1) % FEEDS.length; at.log = []; }
+      }
+      break;
+    }
+    case G.PINCH: {
+      if(!t) break;
+      activeId = t.id; t.docked = false;
+      const d = Math.hypot(p.x - t.cx, p.y - t.cy);
+      if(!t.grab || t.grab.mode !== "scale"){
+        t.grab = { mode:"scale", d0: Math.max(40, d), w0: t.t.w, h0: t.t.h,
+                   cx: t.cx, cy: t.cy };
+      }
+      const k = clamp(Math.max(40, d) / t.grab.d0, 0.22, 2.6);
+      const w = clamp(t.grab.w0*k, 150, W*0.92), hh = clamp(t.grab.h0*k, 100, H*0.92);
+      t.t = { x: t.grab.cx - w/2, y: t.grab.cy - hh/2, w, h: hh };
+      break;
+    }
+    case G.C_GRIP: {
+      if(!t) break;
+      activeId = t.id; t.docked = false;
+      if(!t.grab || t.grab.mode !== "move"){
+        t.grab = { mode:"move", ox: t.t.x - p.x, oy: t.t.y - p.y };
+      }
+      t.t = { x: clamp(p.x + t.grab.ox, -t.t.w*0.3, W - t.t.w*0.7),
+              y: clamp(p.y + t.grab.oy, -8, H - t.t.h*0.5),
+              w: t.t.w, h: t.t.h };
+      break;
+    }
+    case G.OPEN_PALM: {
+      if(!t) break;
+      activeId = t.id; t.grab = null; t.docked = false;
+      const w = Math.min(DEFAULT_W*1.25, W*0.82), hh = Math.min(DEFAULT_H*1.25, H*0.78);
+      t.t = { x: clamp(t.cx - w/2, 12, W - w - 12), y: clamp(t.cy - hh/2, 12, H - hh - 12), w, h: hh };
+      break;
+    }
+    case G.FIST: {
+      if(!t || h._closed) break;
+      t.fistT += dt;
+      if(t.fistT >= FIST_HOLD){ t.closing = true; h._closed = true; }
+      break;
+    }
+    case G.MOUTH_COVER: {
+      if(h.candT > 0.55 && !h._info){
+        h._info = true;
+        const exists = terms.find(x => x.kind === "INFO" && !x.closing);
+        if(!exists){
+          const w = Math.min(660, W*0.62), hh = Math.min(430, H*0.60);
+          const anchor = faceBox ? toScreen({x:faceBox.x + faceBox.w/2, y:faceBox.y}, fit)
+                                 : { x: W/2, y: H*0.42 };
+          const it = new Terminal({ x: clamp(anchor.x - w/2, 12, W - w - 12),
+                                    y: clamp(anchor.y - hh - 26, 12, H - hh - 12),
+                                    w, h: hh }, "INFO");
+          it.pinned = true;
+          terms.push(it); activeId = it.id;
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  if(h.gest !== G.FIST)   h._closed  = false;
+  if(h.gest !== G.PEACE)  h._spawned = false;
+  if(h.gest !== G.POINT)  h._cycled  = false;
+  if(h.gest !== G.THUMB_UP) h._feed  = false;
+  if(h.gest !== G.MOUTH_COVER) h._info = false;
+  if(h.gest !== G.PINCH && h.gest !== G.C_GRIP){
+    for(const x of terms) if(x.grab) x.grab = null;
+  }
+  if(h.gest !== G.FIST) for(const x of terms) x.fistT = 0;
+}
+
+const toScreen = (p, fit)=> ({ x: fit.ox + (p.x/AR)*fit.dw, y: fit.oy + p.y*fit.dh });
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §10  SIM — scripted synthetic hands so the whole thing demos with no camera
+   ═══════════════════════════════════════════════════════════════════════════ */
+const CANON = [
+  [0,0],[-0.10,-0.08],[-0.20,-0.20],[-0.27,-0.30],[-0.33,-0.38],
+  [-0.06,-0.42],[-0.07,-0.60],[-0.08,-0.71],[-0.08,-0.80],
+  [0.02,-0.44],[0.03,-0.63],[0.03,-0.75],[0.03,-0.85],
+  [0.10,-0.42],[0.12,-0.59],[0.13,-0.70],[0.13,-0.79],
+  [0.17,-0.37],[0.20,-0.51],[0.22,-0.60],[0.23,-0.67],
+];
+/* Fingers are articulated as real kinematic chains — each joint flexes by its
+   own share of the curl and the rotation accumulates down the chain. Rotating
+   a finger rigidly about the knuckle (which is what v1's sim did) leaves it
+   geometrically straight, and the joint-angle curl test in §2 correctly reads
+   that as "not bent". */
+const FLEX = [0.95, 1.30, 0.85];   // MCP, PIP, DIP share of a full curl
+function synthHand(cx, cy, scale, rot, curls, flip, aspect, pinchAmt=0, abduct=0){
+  const pts = CANON.map(p => [p[0], p[1]]);
+  CHAINS.forEach((chain, fi)=>{
+    const c = curls[fi];
+    if(c <= 0.001) return;
+    let ang = 0;
+    for(let k = 1; k < chain.length; k++){
+      const i = chain[k], prev = chain[k-1];
+      const seg = [CANON[i][0] - CANON[prev][0], CANON[i][1] - CANON[prev][1]];
+      ang += FLEX[k-1]*c;
+      const ca = Math.cos(ang), sa = Math.sin(ang);
+      pts[i] = [ pts[prev][0] + ca*seg[0] - sa*seg[1],
+                 pts[prev][1] + sa*seg[0] + ca*seg[1] ];
+    }
+  });
+  if(abduct > 0){                         // splay the thumb away from the index
+    const a = -abduct*0.85, ca = Math.cos(a), sa = Math.sin(a);
+    for(const i of [2,3,4]){
+      const dx = pts[i][0] - pts[1][0], dy = pts[i][1] - pts[1][1];
+      pts[i] = [pts[1][0] + ca*dx - sa*dy, pts[1][1] + sa*dx + ca*dy];
+    }
+  }
+  if(pinchAmt > 0){                       // pull thumb tip toward index tip
+    for(const i of [3,4]){
+      pts[i][0] = lerp(pts[i][0], pts[8][0], pinchAmt*0.92);
+      pts[i][1] = lerp(pts[i][1], pts[8][1], pinchAmt*0.92);
+    }
+  }
+  const cr = Math.cos(rot), sr = Math.sin(rot);
+  return pts.map(([x,y], i)=>{
+    if(flip) x = -x;
+    return { x: cx + (cr*x - sr*y)*scale/aspect, y: cy + (sr*x + cr*y)*scale, z: 0.02*Math.sin(i*0.7) };
+  });
+}
+/* timeline: idle → frame(pin) → pinch → open → c-grip → peace → fist */
+const SIM_STEPS = [
+  { t:2.0,  n:"idle"  }, { t:9.0,  n:"frame" }, { t:13.0, n:"pinch" },
+  { t:16.0, n:"open"  }, { t:20.0, n:"cgrip" }, { t:23.0, n:"peace" },
+  { t:26.0, n:"fist"  }, { t:29.0, n:"idle"  },
+];
+const CURLS = {
+  idle:  [0.10,0.12,0.12,0.14,0.16],
+  frame: [0.00,0.00,1.00,1.00,1.00],
+  pinch: [0.10,0.15,0.95,0.95,0.95],
+  open:  [0.05,0.05,0.05,0.06,0.08],
+  cgrip: [0.05,0.10,0.95,0.95,0.95],
+  peace: [0.90,0.02,0.04,0.95,0.95],
+  fist:  [0.95,0.98,0.98,0.98,0.98],
+};
+function simHands(time, aspect){
+  const cyc = time % 29;
+  let step = SIM_STEPS[SIM_STEPS.length-1].n, prev = "idle", frac = 1;
+  for(let i = 0; i < SIM_STEPS.length; i++){
+    if(cyc < SIM_STEPS[i].t){
+      step = SIM_STEPS[i].n;
+      prev = i > 0 ? SIM_STEPS[i-1].n : "idle";
+      const t0 = i > 0 ? SIM_STEPS[i-1].t : 0;
+      frac = clamp((cyc - t0)/0.7, 0, 1);
+      break;
+    }
+  }
+  const cA = CURLS[prev] || CURLS.idle, cB = CURLS[step] || CURLS.idle;
+  const e = frac*frac*(3-2*frac);
+  const curls = cA.map((v,i)=> lerp(v, cB[i], e));
+  const wob = Math.sin(time*1.1)*0.012, wob2 = Math.cos(time*0.9)*0.014;
+  const pinchAmt = step === "pinch" ? e : 0;
+  const twoHand = (step === "frame");
+  if(twoHand){
+    return [
+      synthHand(0.26 + wob, 0.28 + wob2, 0.30,  Math.PI/2, curls, true, aspect),
+      synthHand(0.74 - wob, 0.72 - wob2, 0.30, -Math.PI/2, curls, true, aspect),
+    ];
+  }
+  const drift = step === "cgrip" ? Math.sin(time*0.8)*0.10 : 0;
+  const rad   = step === "pinch" ? 0.30 + Math.sin(time*0.9)*0.10 : 0;
+  return [ synthHand(0.50 + drift + rad, 0.52 - rad*0.4, 0.30, -0.25, curls, true, aspect, pinchAmt) ];
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §11  MAIN LOOP
+   ═══════════════════════════════════════════════════════════════════════════ */
+let prev = performance.now(), fpsAcc = 0, fpsN = 0, fps = 0, lastPinned = 0;
+const t0 = prev;
+
+function loop(){
+  const now = performance.now();
+  const dt = clamp((now - prev)/1000, 0.001, 0.05);
+  dtms = now - prev; prev = now;
+  const time = (now - t0)/1000;
+  fpsAcc += 1/dt; fpsN++;
+  if(fpsN >= 20){ fps = fpsAcc/fpsN; fpsAcc = 0; fpsN = 0; $("tFps").textContent = fps.toFixed(0); }
+
+  g.setTransform(DPR,0,0,DPR,0,0);
+
+  // ── acquire ──
+  let fit = { ox:0, oy:0, dw:W, dh:H }, mirror = false, raw = [];
+  if(mode === "cam" && vid.readyState >= 2){
+    const vw = vid.videoWidth, vh = vid.videoHeight;
+    const sc = Math.max(W/vw, H/vh), dw = vw*sc, dh = vh*sc;
+    fit = { ox:(W-dw)/2, oy:(H-dh)/2, dw, dh };
+    mirror = true; AR = vw/vh;
+    if(landmarker && vid.currentTime !== lastVideoTime){
+      lastVideoTime = vid.currentTime;
+      try { cachedHands = (landmarker.detectForVideo(vid, now).landmarks) || []; } catch(e){}
+      if(faceDet && (faceTick++ % 4 === 0)){
+        try {
+          const fr = faceDet.detectForVideo(vid, now);
+          const d = fr.detections && fr.detections[0];
+          faceBox = d ? {
+            x: (mirror ? 1 - (d.boundingBox.originX + d.boundingBox.width)/vw
+                       : d.boundingBox.originX/vw) * AR,
+            y: d.boundingBox.originY/vh,
+            w: (d.boundingBox.width/vw)*AR,
+            h: d.boundingBox.height/vh,
+          } : null;
+        } catch(e){}
+      }
+    }
+    raw = cachedHands;
+  } else {
+    AR = W/H;
+    raw = simHands(time, AR);
+    faceBox = { x: 0.42*AR, y: 0.10, w: 0.16*AR, h: 0.26 };
+  }
+
+  // ── §2/§3: per-hand state + single-hand classification ──
+  const hands = [];
+  for(let i = 0; i < Math.min(2, raw.length); i++){
+    const h = handStates[i];
+    h.update(raw[i], dt, mirror, AR);
+    classifySingle(h, dt, faceBox);
+    hands.push(h);
+  }
+  for(let i = raw.length; i < 2; i++) handStates[i].lost += dt;
+
+  // ── §4: two-hand classification ──
+  classifyPair(hands, dt, pairState);
+
+  // ── §9: drive the workspace ──
+  applyPair(fit, dt, time);
+  if(pairState.pair === PAIR.NONE) for(const h of hands) applySingle(h, fit, dt);
+
+  // ── terminal bookkeeping (reverse loop: we splice inside it) ──
+  for(let i = terms.length - 1; i >= 0; i--){
+    const t = terms[i];
+    t.step(dt);
+    if(t.kind === "SHELL" && t.open > 0.5){
+      t.acc += dt;
+      if(t.acc > 0.12){
+        t.acc = 0;
+        for(const ln of feedLines(t, hands, pairState.pair, time)) t.push(ln);
+      }
+    }
+    if(t.closing && t.open < 0.02){
+      terms.splice(i, 1);
+      if(activeId === t.id) activeId = terms.length ? terms[0].id : null;
+    }
+  }
+  /* Only re-arrange when the set of terminals actually changes — running it
+     every frame would snap a terminal back while you're moving it. */
+  const nPinned = terms.filter(t => t.pinned && !t.closing).length;
+  if(nPinned !== lastPinned){ lastPinned = nPinned; if(nPinned >= DOCK_MIN) arrange(); }
+
+  // ── render ──
+  const openAmt = terms.reduce((m,t)=> Math.max(m, t.open), 0);
+  drawBackground(fit, openAmt);
+
+  if(showSkel){
+    for(const h of hands){
+      const pts = h.m.map(p => toScreen(p, fit));
+      drawHand(h, pts, h.gest === G.NONE ? null : h.gest);
+    }
+    if(pairState.pair === PAIR.FRAME && pairState.corners){
+      const A = toScreen(pairState.corners[0], fit), B = toScreen(pairState.corners[1], fit);
+      g.strokeStyle = "rgba(53,224,192,0.35)"; g.lineWidth = 1;
+      g.setLineDash([5,5]);
+      g.strokeRect(Math.min(A.x,B.x), Math.min(A.y,B.y), Math.abs(A.x-B.x), Math.abs(A.y-B.y));
+      g.setLineDash([]);
+      if(liveTerm && !liveTerm.pinned){
+        const p = clamp(liveTerm.holdT/PIN_HOLD, 0, 1);
+        g.strokeStyle = TERM.fg; g.lineWidth = 2.5;
+        g.beginPath();
+        g.moveTo(Math.min(A.x,B.x), Math.min(A.y,B.y) - 7);
+        g.lineTo(Math.min(A.x,B.x) + Math.abs(A.x-B.x)*p, Math.min(A.y,B.y) - 7);
+        g.stroke();
+      }
+    }
+  }
+  for(const t of terms) drawTerminal(t, now);
+
+  // ── telemetry ──
+  $("tHands").textContent = hands.length;
+  $("tL").textContent = hands[0] ? hands[0].gest : "—";
+  $("tR").textContent = hands[1] ? hands[1].gest : "—";
+  $("tPair").textContent = pairState.pair;
+  $("tConf").style.transform = "scaleX(" + (hands[0] ? hands[0].gestScore : 0).toFixed(2) + ")";
+  $("tTerms").textContent = terms.length + (terms.some(t=>t.docked) ? " (docked)" : "");
+
+  requestAnimationFrame(loop);
+}
+loop();
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §12  CONTROLS
+   ═══════════════════════════════════════════════════════════════════════════ */
+const status = $("status");
+function sync(){
+  $("bCam").classList.toggle("on", mode === "cam");
+  $("bSim").classList.toggle("on", mode === "sim");
+  $("bSkel").classList.toggle("on", showSkel);
+  $("bMosaic").classList.toggle("on", mosaic);
+}
+sync();
+
+async function startCam(){
+  status.textContent = "loading models …";
+  try {
+    const mp = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14");
+    const files = await mp.FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    landmarker = await mp.HandLandmarker.createFromOptions(files, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "GPU",
+      },
+      runningMode: "VIDEO", numHands: 2,
+      minHandDetectionConfidence: 0.55, minTrackingConfidence: 0.55,
+    });
+    try {
+      faceDet = await mp.FaceDetector.createFromOptions(files, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.task",
+          delegate: "GPU",
+        },
+        runningMode: "VIDEO",
+      });
+    } catch(e){ faceDet = null; }   // mouth-cover falls back to a screen heuristic
+  } catch(e){
+    status.textContent = "couldn't load the models — needs an internet connection and http://localhost (not file://). Staying in SIM.";
+    return;
+  }
+  try {
+    const st = await navigator.mediaDevices.getUserMedia({
+      video:{ width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:60}, facingMode:"user" }, audio:false });
+    vid.srcObject = st; await vid.play();
+  } catch(e){
+    status.textContent = "camera blocked — serve this folder over http://localhost and allow access. Staying in SIM.";
+    return;
+  }
+  mode = "cam"; cachedHands = []; sync();
+  status.textContent = "camera live" + (faceDet ? " · face detector on" : " · face detector unavailable");
+}
+
+$("bCam").onclick = ()=>{ if(mode !== "cam") startCam(); };
+$("bSim").onclick = ()=>{
+  mode = "sim";
+  if(vid.srcObject){ vid.srcObject.getTracks().forEach(t=>t.stop()); vid.srcObject = null; }
+  cachedHands = []; sync();
+  status.textContent = "running SIM — scripted hands, no camera needed.";
+};
+$("bSkel").onclick = ()=>{ showSkel = !showSkel; sync(); };
+$("bMosaic").onclick = ()=>{ mosaic = !mosaic; sync(); };
+$("bClear").onclick = ()=>{ terms.length = 0; liveTerm = null; activeId = null; };
+$("bFeed").onclick = e=>{
+  const at = activeTerm();
+  if(at){ at.feed = (at.feed + 1) % FEEDS.length; at.log = []; e.target.textContent = "FEED: " + FEEDS[at.feed]; }
+};
+</script>
+</body>
+</html>

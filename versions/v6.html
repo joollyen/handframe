@@ -1,0 +1,1420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HANDFRAME v6 — gesture-driven instruments</title>
+<!--
+  HANDFRAME v6
+  ═══════════════════════════════════════════════════════════════════════════
+  RUN IT:  python3 -m http.server 8000  →  http://localhost:8000/handframe-v4.html
+
+  GESTURES
+  ---------------------------------------------------------------------------
+  TWO HANDS
+    FRAME       both hands in an L, on a diagonal → create a window
+    RESIZE      while one open palm holds a window, the other hand's
+                thumb-index gap scales it — pinch shut to shrink, open to grow
+    CLEAR       both hands open and pointing up, held 5s → wipe everything.
+                Deliberately slow: raising both hands is also the approach to
+                the framing pose, so a short hold fires while you're lining up.
+  ONE HAND
+    OPEN PALM   over a window → it lights green and follows your hand.
+                Close or relax the hand to drop it there.
+    SWIPE       while holding → throw it off that edge and close it
+    POINT       index only     → select the next window
+    PEACE       index + middle → spawn a window
+    THUMB_UP    thumb up       → cycle that window's feed
+
+  WINDOW BUDGET
+  ---------------------------------------------------------------------------
+  At most 3 windows float free. Create a fourth and the least-recently-touched
+  one folds into a shelf in the top-right — a labelled container holding the
+  parked windows as an overlapping cascade, newest card in front. It holds 5;
+  push past that and the oldest is discarded. Grab a card with an open palm to
+  pull it back out to full size.
+
+  WHY OPEN PALM AND NOT A FIST
+  ---------------------------------------------------------------------------
+  v3 used a closed fist as the grab. MediaPipe's landmark quality collapses on
+  a fist — the fingers occlude one another and there's nothing left to track,
+  so it frequently never registers at all. An open palm is the single most
+  reliable pose in the whole set, which makes it the right choice for the
+  gesture you hold continuously.
+
+  TRACKING
+  ---------------------------------------------------------------------------
+  Landmarks are filtered (One-Euro), extrapolated one frame ahead
+  (Θt0 = Θt−1 + α(Θt−1 − Θt−2), α = 0.5), then normalized into a palm frame
+  recovered by PCA over the palm landmarks, so every gesture test is
+  translation-, rotation- and scale-invariant. Gestures are scored hypotheses
+  with early rejection rather than a chain of if-statements. Method after
+  Sridhar/Oulasvirta/Theobalt (MPI), "Interactive Markerless Articulated Hand
+  Motion Tracking Using RGB and Depth Data".
+  ═══════════════════════════════════════════════════════════════════════════
+-->
+<style>
+  :root{ --bg:#04070a; --panel:rgba(9,16,20,.88); --line:#1c2b33;
+         --ink:#dfeff2; --dim:#6f8a93; --acc:#35e0c0; --grab:#7cffa0; }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);overflow:hidden;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--ink)}
+  #cv{position:fixed;inset:0;width:100%;height:100%;display:block}
+  video{position:fixed;width:2px;height:2px;opacity:0;pointer-events:none;top:0;left:0}
+  #hud{position:fixed;top:14px;left:14px;user-select:none;background:var(--panel);
+    border:1px solid var(--line);padding:11px 13px;width:270px;backdrop-filter:blur(6px)}
+  .ch{display:flex;align-items:baseline;gap:9px;margin-bottom:2px}
+  .ch b{font-size:10px;font-weight:600;letter-spacing:.22em;color:var(--acc)}
+  .ch span{font-size:12px;letter-spacing:.06em}
+  .sub{font-size:8.5px;letter-spacing:.14em;color:var(--dim);
+    border-bottom:1px solid var(--line);padding-bottom:8px;margin-bottom:9px}
+  .row{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:7px}
+  button{background:#0d161b;border:1px solid var(--line);color:var(--ink);
+    font:inherit;font-size:9.5px;letter-spacing:.11em;padding:5px 9px;cursor:pointer}
+  button:hover{border-color:var(--acc)}
+  button.on{background:var(--acc);border-color:var(--acc);color:#04120f}
+  #status{font-size:9px;line-height:1.5;margin-bottom:7px;min-height:24px}
+  #tele{display:grid;grid-template-columns:auto 1fr;gap:3px 9px;
+    font-size:8.5px;letter-spacing:.11em;color:var(--dim);align-items:center}
+  #tele s{text-decoration:none;color:var(--ink);font-size:9px}
+  .meter{height:4px;background:var(--line);position:relative;overflow:hidden}
+  .meter i{position:absolute;inset:0;transform-origin:left;transform:scaleX(0);
+    background:var(--acc);display:block}
+  #keys{margin-top:9px;border-top:1px dashed var(--line);padding-top:7px;
+    font-size:8px;line-height:1.75;color:var(--dim)}
+  #keys b{color:var(--ink);font-weight:600}
+</style>
+</head>
+<body>
+<video id="vid" playsinline muted></video>
+<canvas id="cv"></canvas>
+
+<div id="hud">
+  <div class="ch"><b>V6</b><span>HANDFRAME</span></div>
+  <div class="sub">PALM-FRAME TRACKING · GESTURE WORKSPACE</div>
+  <div class="row">
+    <button id="bCam">CAMERA</button>
+    <button id="bSim" class="on">SIM</button>
+    <button id="bSkel">SKELETON</button>
+  </div>
+  <div class="row">
+    <button id="bFeed">FEED</button>
+    <button id="bMosaic" class="on">MOSAIC</button>
+    <button id="bClear">CLEAR ALL</button>
+  </div>
+  <div id="status">running SIM — scripted hands, no camera needed.</div>
+  <div id="tele">
+    <span>HANDS</span><s id="tHands">0</s>
+    <span>HAND 1</span><s id="tL">—</s>
+    <span>HAND 2</span><s id="tR">—</s>
+    <span>PAIR</span><s id="tPair">—</s>
+    <span>GRAB</span><s id="tGrab">—</s>
+    <span>LAYOUT</span><s id="tLayout">—</s>
+    <span>CONF</span><div class="meter"><i id="tConf"></i></div>
+    <span>TERMS</span><s id="tTerms">0</s>
+    <span>FPS</span><s id="tFps">—</s>
+  </div>
+  <div id="keys">
+    <b>FRAME</b> two L hands → new window<br>
+    <b>OPEN PALM</b> over a window → grab &amp; move (green)<br>
+    <b>OTHER HAND</b> pinch/open → resize while held<br>
+    <b>SWIPE</b> while holding → throw it off screen<br>
+    <b>BOTH HANDS UP 5s</b> → clear everything<br>
+    <b>POINT</b> select · <b>PEACE</b> new · <b>THUMB UP</b> panel<br>
+    Panels: telemetry · vectorscope · motion · edges<br>
+    3 windows max; the rest fold into the shelf — reach toward it and
+    the stack fans open
+  </div>
+</div>
+
+<script type="module">
+"use strict";
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §0  CONFIG
+   ═══════════════════════════════════════════════════════════════════════════ */
+const TERM = {
+  bg:      "#000000",     // pure black …
+  bgAlpha: 0.90,          // … at 90%, so the mosaic bleeds through the last 10%
+  fg:      "#ffffff",
+  dim:     "#9aa3ad",
+  hot:     "#ffffff",
+  warn:    "#d8dee6",
+  border:  "rgba(255,255,255,0.30)",
+  grab:    "#7cffa0",     // light green — "you have hold of this"
+};
+const DEFAULT_W = 560, DEFAULT_H = 340;
+const COMMIT_HOLD = 0.40;   // frame held this long → the terminal commits
+const MAX_ACTIVE  = 3;      // free-floating windows allowed on screen
+const MAX_DOCK    = 5;      // overflow shelf, top-right
+const DOCK_PAD    = 16, DOCK_GAP = 8;
+const CLEAR_HOLD  = 5.00;   // both hands up this long → wipe the workspace.
+                            // Long on purpose: raising both hands is also the
+                            // approach path to the framing pose, so anything
+                            // shorter fires while you're lining up a window.
+
+/* Latency budget. Every one of these trades stability for responsiveness;
+   they're grouped so you can dial the whole feel from one place. */
+const TUNE = {
+  euroCutoff: 2.60,   // One-Euro min cutoff — higher = snappier, noisier
+  euroBeta:   0.022,  // speed coefficient — higher = less lag when moving fast
+  settle:     0.045,  // seconds a gesture must persist before it commits
+  settleHold: 0.030,  // …for the held grab, which should feel instant
+  extrap:     0.75,   // fraction of the frame delta projected forward
+  detConf:    0.40,   // model thresholds — lower = picks hands up sooner
+  trkConf:    0.40,
+};
+const MOSAIC_PX   = 16;     // block size of the in-terminal mosaic
+const SWIPE_V     = 2.0;    // metric units/sec to fling a grabbed terminal away
+const MIN_W = 150, MIN_H = 100;
+
+const G = { NONE:"NONE", L_CORNER:"L_CORNER", PINCH:"PINCH", OPEN_PALM:"OPEN_PALM",
+            FIST:"FIST", POINT:"POINT", PEACE:"PEACE", THUMB_UP:"THUMB_UP" };
+const PAIR = { NONE:"NONE", FRAME:"FRAME", CLEAR:"CLEAR" };
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §1  MATH & FILTERS
+   ═══════════════════════════════════════════════════════════════════════════ */
+const clamp = (v,a,b)=> v<a?a:v>b?b:v;
+const lerp  = (a,b,t)=> a+(b-a)*t;
+const dist2 = (a,b)=> Math.hypot(a.x-b.x, a.y-b.y);
+const sub   = (a,b)=> ({x:a.x-b.x, y:a.y-b.y});
+const norm  = v => { const l=Math.hypot(v.x,v.y)||1; return {x:v.x/l, y:v.y/l}; };
+const dot   = (a,b)=> a.x*b.x + a.y*b.y;
+const angBetween = (a,b)=> Math.acos(clamp(dot(norm(a),norm(b)), -1, 1));
+function band(v, lo, hi, soft){
+  if(v >= lo && v <= hi) return 1;
+  const d = v < lo ? lo - v : v - hi;
+  return clamp(1 - d/soft, 0, 1);
+}
+
+
+class OneEuro {
+  constructor(minCutoff=TUNE.euroCutoff, beta=TUNE.euroBeta, dCutoff=1.0){
+    this.mc=minCutoff; this.beta=beta; this.dc=dCutoff; this.x=null; this.dx=0;
+  }
+  static alpha(c, dt){ const tau = 1/(2*Math.PI*c); return 1/(1 + tau/dt); }
+  filter(x, dt){
+    if(this.x === null){ this.x = x; return x; }
+    const dx = (x - this.x)/dt;
+    const ad = OneEuro.alpha(this.dc, dt);
+    this.dx = ad*dx + (1-ad)*this.dx;
+    const a = OneEuro.alpha(this.mc + this.beta*Math.abs(this.dx), dt);
+    this.x = a*x + (1-a)*this.x;
+    return this.x;
+  }
+}
+function pca2(pts){
+  let cx=0, cy=0;
+  for(const p of pts){ cx+=p.x; cy+=p.y; }
+  cx/=pts.length; cy/=pts.length;
+  let sxx=0, syy=0, sxy=0;
+  for(const p of pts){ const dx=p.x-cx, dy=p.y-cy; sxx+=dx*dx; syy+=dy*dy; sxy+=dx*dy; }
+  const n=pts.length; sxx/=n; syy/=n; sxy/=n;
+  const tr=sxx+syy, det=sxx*syy-sxy*sxy;
+  const disc=Math.max(0, tr*tr/4-det);
+  const l1=tr/2+Math.sqrt(disc), l2=tr/2-Math.sqrt(disc);
+  let ax;
+  if(Math.abs(sxy) > 1e-12) ax = norm({x:l1-syy, y:sxy});
+  else ax = sxx>=syy ? {x:1,y:0} : {x:0,y:1};
+  return { c:{x:cx,y:cy}, axis:ax, l1, l2, aniso:l1/Math.max(l2,1e-9) };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §2  HAND MODEL
+   ═══════════════════════════════════════════════════════════════════════════ */
+const BONES=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[0,9],[9,10],[10,11],
+  [11,12],[0,13],[13,14],[14,15],[15,16],[0,17],[17,18],[18,19],[19,20],
+  [5,9],[9,13],[13,17],[2,5]];
+const CHAINS=[[1,2,3,4],[5,6,7,8],[9,10,11,12],[13,14,15,16],[17,18,19,20]];
+const TIPS=[4,8,12,16,20];
+const PALM_IDX=[0,1,5,9,13,17];
+const EXTRAP_ALPHA=0.5;
+
+class HandState {
+  constructor(id){
+    this.id=id;
+    this.fx=Array.from({length:21},()=>new OneEuro());
+    this.fy=Array.from({length:21},()=>new OneEuro());
+    this.prev=null; this.prev2=null;
+    this.gest=G.NONE; this.gestScore=0;
+    this.candidate=G.NONE; this.candT=0;
+    this.vel={x:0,y:0}; this.speed=0; this.prevC=null; this.lastRawC=null;
+    this.side="?"; this.lost=99; this.age=0;
+  }
+  /* A hand that drops out and returns must start clean. Without this, prevC
+     still holds wherever the hand was seconds ago, so the first frame back
+     computes a colossal phantom velocity — enough to trip swipe-to-close and
+     hurl a window off screen for no reason. Same for the One-Euro filters,
+     which would otherwise lurch across the gap. */
+  reset(){
+    this.fx=Array.from({length:21},()=>new OneEuro());
+    this.fy=Array.from({length:21},()=>new OneEuro());
+    this.prev=null; this.prev2=null; this.prevC=null;
+    this.vel={x:0,y:0}; this.speed=0; this.age=0;
+    this.gest=G.NONE; this.candidate=G.NONE; this.candT=0;
+  }
+  update(lm, dt, mirror, AR, side){
+    const raw = lm.map(p=>({ x:(mirror ? 1-p.x : p.x)*AR, y:p.y, z:p.z||0 }));
+    const f = raw.map((p,i)=>({ x:this.fx[i].filter(p.x,dt), y:this.fy[i].filter(p.y,dt), z:p.z }));
+    let p = f;
+    if(this.prev && this.prev2){
+      p = f.map((q,i)=>({
+        x:q.x + EXTRAP_ALPHA*(this.prev[i].x-this.prev2[i].x)*TUNE.extrap,
+        y:q.y + EXTRAP_ALPHA*(this.prev[i].y-this.prev2[i].y)*TUNE.extrap, z:q.z }));
+    }
+    this.prev2=this.prev; this.prev=f;
+    this.m=p;
+    if(side) this.side=side;
+
+    const pc = pca2(PALM_IDX.map(i=>p[i]));
+    this.palm=pc;
+    this.span=Math.max(1e-6, dist2(p[0],p[9]));
+    const fwd=norm(sub(p[9],p[0]));
+    const sgn=dot(pc.axis,fwd)<0?-1:1;
+    this.axis={x:pc.axis.x*sgn, y:pc.axis.y*sgn};
+    this.angle=Math.atan2(this.axis.y,this.axis.x);
+
+    const ca=Math.cos(-this.angle), sa=Math.sin(-this.angle);
+    this.n=p.map(q=>{
+      const dx=(q.x-p[0].x)/this.span, dy=(q.y-p[0].y)/this.span;
+      return { x:ca*dx-sa*dy, y:sa*dx+ca*dy };
+    });
+    this.curl=CHAINS.map(ch=>{
+      const a=sub(this.n[ch[1]],this.n[ch[0]]);
+      const b=sub(this.n[ch[3]],this.n[ch[2]]);
+      return clamp(angBetween(a,b)/(Math.PI*0.82),0,1);
+    });
+    this.ext=this.curl.map(c=>1-c);
+
+    const tipC={x:0,y:0};
+    for(const t of TIPS){ tipC.x+=this.n[t].x; tipC.y+=this.n[t].y; }
+    tipC.x/=5; tipC.y/=5;
+    let gather=0;
+    for(const t of TIPS) gather+=dist2(this.n[t],tipC);
+    this.f={
+      pinch: dist2(this.n[4],this.n[8]),
+      gather: gather/5,
+      spread: dist2(this.n[8],this.n[20]),
+      thumbIdxAng: angBetween(sub(this.n[4],this.n[2]), sub(this.n[8],this.n[5])),
+      aniso: pc.aniso,
+    };
+    this.centroidM={ x:(p[0].x+p[9].x)/2, y:(p[0].y+p[9].y)/2 };
+
+    // velocity, for swipe-to-close
+    if(this.prevC){
+      const vx=(this.centroidM.x-this.prevC.x)/dt, vy=(this.centroidM.y-this.prevC.y)/dt;
+      this.vel.x=lerp(this.vel.x,vx,0.40); this.vel.y=lerp(this.vel.y,vy,0.40);
+    }
+    this.prevC={...this.centroidM};
+    this.speed=Math.hypot(this.vel.x,this.vel.y);
+    this.lastRawC={ x:(lm[0].x+lm[9].x)/2, y:(lm[0].y+lm[9].y)/2 };
+    this.age+=dt; this.lost=0;
+  }
+  settle(g_, score, dt, need=TUNE.settle){
+    if(g_===this.candidate) this.candT+=dt;
+    else { this.candidate=g_; this.candT=0; }
+    if(this.candT>=need || g_===this.gest){ this.gest=g_; this.gestScore=score; }
+    return this.gest;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §3  SINGLE-HAND TRACKING
+   ═══════════════════════════════════════════════════════════════════════════ */
+const REJECT = 0.55;
+
+const SINGLE = [
+  { id: G.PINCH, score(h){
+      const near  = band(h.f.pinch, 0, 0.34, 0.24);
+      const others= (h.curl[2]+h.curl[3]+h.curl[4])/3;
+      return 0.62*near + 0.20*clamp(others*1.4,0,1) + 0.18*band(h.f.gather,0,0.55,0.35);
+    }},
+  { id: G.OPEN_PALM, score(h){
+      const open=(h.ext[0]+h.ext[1]+h.ext[2]+h.ext[3]+h.ext[4])/5;
+      return 0.60*clamp((open-0.45)/0.45,0,1) + 0.40*band(h.f.spread,0.85,3.0,0.45);
+    }},
+  { id: G.L_CORNER, score(h){
+      const rigid=Math.min(h.ext[0],h.ext[1]);
+      const perp =band(h.f.thumbIdxAng,0.42,2.20,0.34);
+      const rest =(h.curl[2]+h.curl[3]+h.curl[4])/3;
+      return 0.40*clamp((rigid-0.55)/0.42,0,1) + 0.28*perp + 0.32*clamp(rest*1.3,0,1);
+    }},
+  { id: G.FIST, score(h){
+      const four=(h.curl[1]+h.curl[2]+h.curl[3]+h.curl[4])/4;
+      const base=0.55*clamp((four-0.42)/0.45,0,1) + 0.20*clamp(h.curl[0]*1.4,0,1)
+                + 0.25*band(h.f.gather,0,0.62,0.30);
+      return base * (1 - 0.45*clamp((h.ext[0]-0.55)/0.35,0,1));
+    }},
+  { id: G.POINT, score(h){
+      const rest=(h.curl[2]+h.curl[3]+h.curl[4])/3;
+      return 0.42*h.ext[1] + 0.34*clamp(rest*1.3,0,1) + 0.24*h.curl[0];
+    }},
+  { id: G.PEACE, score(h){
+      const rest=(h.curl[3]+h.curl[4])/2;
+      const v=band(dist2(h.n[8],h.n[12]),0.28,1.2,0.28);
+      return 0.28*h.ext[1] + 0.28*h.ext[2] + 0.26*clamp(rest*1.3,0,1) + 0.18*v;
+    }},
+  { id: G.THUMB_UP, score(h){
+      const up=clamp(-(h.m[4].y-h.m[0].y)/Math.max(h.span,1e-6),0,1.4)/1.4;
+      if(up < 0.34) return 0;
+      const rest=(h.curl[1]+h.curl[2]+h.curl[3]+h.curl[4])/4;
+      return 0.30*h.ext[0] + 0.34*clamp(rest*1.25,0,1) + 0.36*up;
+    }},
+];
+
+function classifySingle(h, dt){
+  let best=G.NONE, bs=0;
+  for(const c of SINGLE){
+    const s=c.score(h);
+    if(s < REJECT) continue;
+    if(s > bs){ bs=s; best=c.id; }
+  }
+  if(best===G.NONE){ h.settle(G.NONE,0,dt,0.03); return {g:G.NONE,s:0}; }
+  // the grab is held continuously, so commit it near-instantly — any settle
+  // time here reads as the window lagging behind your hand
+  return { g:h.settle(best,bs,dt, best===G.OPEN_PALM ? TUNE.settleHold : TUNE.settle), s:bs };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §4  MULTI-HAND TRACKING
+   ═══════════════════════════════════════════════════════════════════════════ */
+const cornerOf = h => ({ x:(h.m[2].x+h.m[5].x)/2, y:(h.m[2].y+h.m[5].y)/2 });
+const lScore = SINGLE.find(s=>s.id===G.L_CORNER).score;
+const oScore = SINGLE.find(s=>s.id===G.OPEN_PALM).score;
+/* "hands up": palm axis (wrist → middle knuckle) pointing up the screen */
+const isUpright = h => h.axis.y < -0.55;
+/* pairT is a per-gesture charge timer, so it resets whenever the pair gesture
+   changes. Without this, four seconds of held FRAME would hand its charge
+   straight to CLEAR the moment your hands relaxed out of the L. */
+function setPair(st, kind, dt){
+  if(st.pair!==kind) st.pairT=0;
+  st.pair=kind; st.pairT+=dt;
+}
+
+function classifyPair(hands, dt, st){
+  if(hands.length < 2){ st.pair=PAIR.NONE; st.pairT=0; return st; }
+  const [a,b]=hands;
+  /* Gate on each hand's SETTLED classification, not the raw hypothesis score.
+     An open palm scores ~0.70 as an L_CORNER — above threshold — so scoring
+     alone would fire FRAME whenever a free hand drifted past while the other
+     was holding a window, spawning phantom terminals. h.gest is the argmax
+     after temporal settling, so it can only be one thing at a time. */
+  const bothL = a.gest===G.L_CORNER && b.gest===G.L_CORNER;
+  const lA=lScore(a), lB=lScore(b);
+  if(bothL && lA>=REJECT && lB>=REJECT){
+    const ca=cornerOf(a), cb=cornerOf(b);
+    if(Math.abs(ca.x-cb.x)>0.16 && Math.abs(ca.y-cb.y)>0.11){
+      setPair(st, PAIR.FRAME, dt);
+      st.pairScore=(lA+lB)/2;
+      st.corners = ca.x<=cb.x ? [ca,cb] : [cb,ca];
+      const lh = ca.x<=cb.x ? a : b;
+      st.tilt = clamp(Math.atan2(lh.m[8].y-lh.m[5].y, lh.m[8].x-lh.m[5].x)*0.55, -0.26, 0.26);
+      return st;
+    }
+  }
+  // both hands open and pointing up → clear the workspace
+  const bothOpen = a.gest===G.OPEN_PALM && b.gest===G.OPEN_PALM;
+  const oA=oScore(a), oB=oScore(b);
+  if(bothOpen && oA>=REJECT && oB>=REJECT && isUpright(a) && isUpright(b)){
+    setPair(st, PAIR.CLEAR, dt); st.pairScore=(oA+oB)/2;
+    return st;
+  }
+  st.pair=PAIR.NONE; st.pairT=0; st.pairScore=0;
+  return st;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §5  TERMINALS
+   ═══════════════════════════════════════════════════════════════════════════ */
+let termSeq = 0;
+class Terminal {
+  constructor(rect, feed){
+    this.id=++termSeq;
+    this.r={...rect}; this.t={...rect};
+    this.open=0; this.target=1;
+    this.tilt=0; this.tiltT=0;
+    this.committed=false;            // false only while the frame is still forming
+    this.grabbedBy=null;             // hand id currently holding it
+    this.grabOff=null; this.sizeRef=null;
+    this.fling=null; this.closing=false;
+    this.log=[]; this.acc=0; this.feed=feed ?? 0;
+    this.docked=false; this.dockedAt=0; this.touchedAt=performance.now();
+    this.dockSlot=-1;
+  }
+  get cx(){ return this.r.x + this.r.w/2; }
+  get cy(){ return this.r.y + this.r.h/2; }
+  contains(p, pad=0){
+    return p.x > this.r.x-pad && p.x < this.r.x+this.r.w+pad &&
+           p.y > this.r.y-pad && p.y < this.r.y+this.r.h+pad;
+  }
+  push(l){ this.log.push(l); if(this.log.length>400) this.log.splice(0,this.log.length-400); }
+  step(dt){
+    if(this.fling){
+      this.t.x += this.fling.x*2600*dt;
+      this.t.y += this.fling.y*2600*dt;
+    }
+    const k=Math.min(1, dt*(this.grabbedBy!==null ? 22 : 12));
+    for(const key of ["x","y","w","h"]) this.r[key]=lerp(this.r[key],this.t[key],k);
+    this.tilt=lerp(this.tilt,this.tiltT,Math.min(1,dt*6));
+    this.open=lerp(this.open, this.closing?0:this.target, Math.min(1, dt*(this.target?9:7)));
+  }
+}
+const terms = [];
+let activeId = null;
+const activeTerm = ()=> terms.find(t=>t.id===activeId) || null;
+
+/* topmost terminal under a point — later entries render on top, so search back */
+function termAt(p){
+  // folder first, front-most card first, since the cascade overlaps
+  const inFolder=terms.filter(t=>!t.closing && t.committed && t.docked && t.contains(p,26))
+                      .sort((a,b)=>a.dockSlot-b.dockSlot);
+  if(inFolder.length) return inFolder[0];
+  for(let i=terms.length-1;i>=0;i--){
+    const t=terms[i];
+    if(!t.closing && t.committed && !t.docked && t.contains(p,20)) return t;
+  }
+  return null;
+}
+
+/* Layout manager: at most MAX_ACTIVE windows float free. Anything beyond
+   that is the least-recently-touched, and it slides onto the top-right
+   shelf. The shelf holds MAX_DOCK; older entries fall off and close. */
+/* The shelf is a folder: one labelled container in the top-right holding the
+   parked windows as an overlapping cascade, newest in front. */
+/* Collapsed, the folder is a tight cascade — which looks right but leaves the
+   back cards covered by the front one, so only the newest was ever grabbable.
+   Bring a hand near and it FANS: the stack spreads into a separated column of
+   smaller cards, each fully exposed and individually targetable. */
+let folderFan=0;
+const FAN_SCALE=0.60;
+function folderGeom(){
+  const tileW=clamp(W*0.20,150,300), tileH=tileW/1.62;
+  const dx=DOCK_GAP*2, dy=DOCK_GAP*1.75, pad=10, head=20, gap=9;
+  const f=folderFan;
+  const cInnerH=tileH+(MAX_DOCK-1)*dy;
+  const fInnerH=MAX_DOCK*(tileH*FAN_SCALE)+(MAX_DOCK-1)*gap;
+  const innerW=tileW+(MAX_DOCK-1)*dx;                 // width stays put
+  const innerH=lerp(cInnerH,fInnerH,f);
+  const fw=innerW+pad*2, fh=innerH+pad*2+head;
+  return { fx:W-fw-DOCK_PAD, fy:DOCK_PAD, fw, fh, pad, head, gap,
+           tileW, tileH, dx, dy, innerW,
+           cw:lerp(tileW,tileW*FAN_SCALE,f), ch:lerp(tileH,tileH*FAN_SCALE,f) };
+}
+function dockRect(slot){
+  const q=folderGeom(), f=folderFan, k=MAX_DOCK-1-slot;   // slot 0 in front
+  const ix=q.fx+q.pad, iy=q.fy+q.pad+q.head;
+  const cx=ix+k*q.dx,  cy=iy+k*q.dy;                      // collapsed cascade
+  const fx=ix+(q.innerW-q.cw)/2, fy=iy+slot*(q.tileH*FAN_SCALE+q.gap);
+  return { x:lerp(cx,fx,f), y:lerp(cy,fy,f), w:q.cw, h:q.ch };
+}
+function enforceLayout(now){
+  const live=terms.filter(t=>!t.closing);
+  const active=live.filter(t=>!t.docked && t.committed).sort((a,b)=>a.touchedAt-b.touchedAt);
+  while(active.length>MAX_ACTIVE){
+    const t=active.shift();
+    t.docked=true; t.dockedAt=now; t.grabbedBy=null; t.sizeRef=null; t.tiltT=0;
+  }
+  const aging=live.filter(t=>t.docked).sort((a,b)=>a.dockedAt-b.dockedAt);
+  while(aging.length>MAX_DOCK){
+    const t=aging.shift();
+    t.docked=false; t.closing=true; t.fling={x:0.9,y:-0.4};
+  }
+  live.filter(t=>t.docked).sort((a,b)=>b.dockedAt-a.dockedAt)
+      .forEach((t,i)=>{ t.dockSlot=i; t.t=dockRect(i); });
+}
+function undock(t, p, now){
+  t.docked=false; t.dockedAt=0; t.dockSlot=-1; t.touchedAt=now;
+  const w=Math.min(DEFAULT_W,W*0.5), h=Math.min(DEFAULT_H,H*0.5);
+  t.t={ x:p.x-w/2, y:p.y-h/2, w, h };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §6  PANELS — one text feed plus three camera-driven instruments
+   ═══════════════════════════════════════════════════════════════════════════ */
+/* One text feed survives; the rest are visual instruments driven by the
+   camera. Each new window takes the next panel in the list, so a fresh
+   workspace is varied by default. THUMB_UP cycles a window's panel. */
+const PANELS = ["TRACK", "VSCOPE", "MOTION", "EDGES"];
+const fmt = (v,n=3)=> (v<0?"":" ") + v.toFixed(n);
+const bar = (v,n=10)=> "█".repeat(clamp(Math.round(v*n),0,n)).padEnd(n,"·");
+
+function feedLines(t, hands, pairName, time){
+  const h=hands[0];
+  const stamp="["+time.toFixed(3).padStart(8)+"]";
+  if(!h) return [{s:"  no hand in frame", c:TERM.dim}];
+  return [
+    {s:`${stamp} ${h.side} conf=${h.gestScore.toFixed(2)} gesture=${h.gest}`, c:TERM.fg},
+    {s:`  wrist  x=${fmt(h.m[0].x)} y=${fmt(h.m[0].y)} z=${fmt(h.m[0].z)}`, c:TERM.dim},
+    {s:`  palm   θ=${(h.angle*180/Math.PI).toFixed(1).padStart(6)}° span=${fmt(h.span)} λ=${h.f.aniso.toFixed(2)}`, c:TERM.dim},
+    {s:`  curl   T${bar(h.curl[0],6)} I${bar(h.curl[1],6)} M${bar(h.curl[2],6)}`, c:TERM.fg},
+    {s:`         R${bar(h.curl[3],6)} P${bar(h.curl[4],6)}`, c:TERM.fg},
+    {s:`  tips   pinch=${fmt(h.f.pinch)} gather=${fmt(h.f.gather)} v=${h.speed.toFixed(2)}`, c:TERM.dim},
+    {s:`  win    ${terms.filter(x=>!x.docked&&!x.closing).length} free · ${terms.filter(x=>x.docked&&!x.closing).length} shelved · ${(1000/Math.max(1,dtms)).toFixed(0)}fps`, c:TERM.dim},
+  ];
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §6b  IMAGE ANALYSIS — one shared downscaled frame feeds every scope
+   ═══════════════════════════════════════════════════════════════════════════ */
+const proc=document.createElement("canvas");
+const procCtx=proc.getContext("2d",{willReadFrequently:true});
+let procData=null, procW=0, procH=0, procReady=false, synthImg=null;
+
+const MCOLS=24, MROWS=14;
+const motionE=new Float32Array(MCOLS*MROWS);
+let prevCell=null, motionTotal=0, motionPeak=0;
+
+const VSN=64;
+const vsCount=new Int32Array(VSN*VSN), vsR=new Int32Array(VSN*VSN),
+      vsG=new Int32Array(VSN*VSN), vsB=new Int32Array(VSN*VSN);
+let vsPeak=1, vsSat=0;
+
+const edgeCv=document.createElement("canvas");
+const edgeCtx=edgeCv.getContext("2d");
+let edgeImg=null, edgeDensity=0;
+
+let lum=null;
+
+/* 75% colour-bar targets, computed through the same transform we plot with,
+   so the graticule can never drift from the trace. */
+const VS_TARGETS=(()=>{
+  const bars={R:[191,0,0],Yl:[191,191,0],G:[0,191,0],Cy:[0,191,191],B:[0,0,191],Mg:[191,0,191]};
+  return Object.entries(bars).map(([k,[r,g_,b]])=>{
+    const Y=0.299*r+0.587*g_+0.114*b;
+    return { k, u:0.564*(b-Y)/255, v:0.713*(r-Y)/255 };
+  });
+})();
+const VS_SC=1.875;    // puts the 75% targets on the 0.75 ring
+
+function prepProc(fit, time){
+  procReady=false;
+  if(mode!=="cam" || vid.readyState<2){ synthProc(time); return; }
+  const pw=192, ph=Math.max(2, Math.round(192*H/W));
+  if(proc.width!==pw||proc.height!==ph){ proc.width=pw; proc.height=ph; }
+  procW=pw; procH=ph;
+  const sc=pw/W;
+  procCtx.save(); procCtx.scale(-1,1);
+  procCtx.drawImage(vid, -(fit.ox+fit.dw)*sc, fit.oy*sc, fit.dw*sc, fit.dh*sc);
+  procCtx.restore();
+  try{ procData=procCtx.getImageData(0,0,pw,ph).data; procReady=true; }catch(e){}
+}
+
+/* SIM has no camera, so the scopes get a synthetic scene — drifting colour
+   blobs, which give all three instruments something real to chew on. */
+function synthProc(time){
+  const pw=160, ph=90;
+  if(proc.width!==pw||proc.height!==ph){ proc.width=pw; proc.height=ph; synthImg=null; }
+  if(!synthImg) synthImg=procCtx.createImageData(pw,ph);
+  const d=synthImg.data;
+  const ax=0.5+0.30*Math.sin(time*0.70), ay=0.5+0.24*Math.cos(time*0.90);
+  const bx=0.4+0.30*Math.cos(time*0.53), by=0.6+0.20*Math.sin(time*1.30);
+  for(let y=0;y<ph;y++){
+    const v=y/ph;
+    for(let x=0;x<pw;x++){
+      const u=x/pw, i=(y*pw+x)*4;
+      const b1=Math.exp(-(((u-ax)**2)+((v-ay)**2))*26);
+      const b2=Math.exp(-(((u-bx)**2)+((v-by)**2))*20);
+      d[i]  =clamp(28+230*b1, 0,255);
+      d[i+1]=clamp(24+210*b2, 0,255);
+      d[i+2]=clamp(46+110*Math.sin(u*9+time)+150*b1*b2, 0,255);
+      d[i+3]=255;
+    }
+  }
+  procData=d; procW=pw; procH=ph; procReady=true;
+}
+
+function analyze(dt){
+  if(!procReady) return;
+  const d=procData, pw=procW, ph=procH, N=pw*ph;
+  if(!lum || lum.length!==N) lum=new Float32Array(N);
+  for(let k=0,i=0;k<N;k++,i+=4) lum[k]=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;
+
+  // ── motion: cell luma vs the previous frame, with decay so blobs linger ──
+  const cell=new Float32Array(MCOLS*MROWS), cnt=new Int32Array(MCOLS*MROWS);
+  for(let y=0;y<ph;y++){
+    const cy=Math.min(MROWS-1,(y*MROWS/ph)|0);
+    for(let x=0;x<pw;x++){
+      const k=cy*MCOLS+Math.min(MCOLS-1,(x*MCOLS/pw)|0);
+      cell[k]+=lum[y*pw+x]; cnt[k]++;
+    }
+  }
+  for(let k=0;k<cell.length;k++) cell[k]/=(cnt[k]||1);
+  if(prevCell){
+    const decay=Math.pow(0.03, dt);
+    let tot=0; motionPeak=0;
+    for(let k=0;k<cell.length;k++){
+      const dl=Math.min(1, Math.abs(cell[k]-prevCell[k])/40);
+      motionE[k]=Math.max(dl, motionE[k]*decay);
+      tot+=dl; if(motionE[k]>motionPeak) motionPeak=motionE[k];
+    }
+    motionTotal=lerp(motionTotal, tot/cell.length, 0.25);
+  }
+  prevCell=cell;
+
+  // ── vectorscope: bin every 2nd pixel into a Cb/Cr grid ──
+  vsCount.fill(0); vsR.fill(0); vsG.fill(0); vsB.fill(0);
+  vsPeak=1; let satAcc=0, satN=0;
+  for(let k=0;k<N;k+=2){
+    const i=k*4, r=d[i], g_=d[i+1], b=d[i+2], Y=lum[k];
+    const U=0.564*(b-Y)/255, V=0.713*(r-Y)/255;
+    satAcc+=Math.hypot(U,V); satN++;
+    const gx=clamp(((U+0.5)*VSN)|0,0,VSN-1), gy=clamp(((0.5-V)*VSN)|0,0,VSN-1);
+    const c=gy*VSN+gx;
+    vsCount[c]++; vsR[c]+=r; vsG[c]+=g_; vsB[c]+=b;
+    if(vsCount[c]>vsPeak) vsPeak=vsCount[c];
+  }
+  vsSat=satN?satAcc/satN:0;
+
+  // ── Sobel ──
+  if(edgeCv.width!==pw||edgeCv.height!==ph){ edgeCv.width=pw; edgeCv.height=ph; edgeImg=null; }
+  if(!edgeImg) edgeImg=edgeCtx.createImageData(pw,ph);
+  const o=edgeImg.data;
+  let lit=0;
+  for(let y=1;y<ph-1;y++){
+    for(let x=1;x<pw-1;x++){
+      const k=y*pw+x;
+      const a=lum[k-pw-1], b2=lum[k-pw], c2=lum[k-pw+1];
+      const e=lum[k-1],    f2=lum[k+1];
+      const g2=lum[k+pw-1],h2=lum[k+pw], i2=lum[k+pw+1];
+      const gx=-a-2*e-g2+c2+2*f2+i2, gy=-a-2*b2-c2+g2+2*h2+i2;
+      const m=Math.min(255, Math.hypot(gx,gy)/4);
+      const q=k*4;
+      o[q]=o[q+1]=o[q+2]=m; o[q+3]=255;
+      if(m>55) lit++;
+    }
+  }
+  edgeCtx.putImageData(edgeImg,0,0);
+  edgeDensity=lit/N;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §7  STAGE
+   ═══════════════════════════════════════════════════════════════════════════ */
+const cv=document.getElementById("cv"), g=cv.getContext("2d");
+const vid=document.getElementById("vid");
+const $=id=>document.getElementById(id);
+const mos=document.createElement("canvas");
+const mosCtx=mos.getContext("2d",{willReadFrequently:true});
+let mosReady=false;
+let W=0,H=0,DPR=1;
+function resize(){
+  DPR=Math.min(window.devicePixelRatio||1,2);
+  W=innerWidth; H=innerHeight;
+  cv.width=Math.floor(W*DPR); cv.height=Math.floor(H*DPR);
+  g.setTransform(DPR,0,0,DPR,0,0);
+}
+addEventListener("resize",resize);
+resize();
+
+let mode="sim", showSkel=true, mosaic=true;
+let landmarker=null, cachedHands=[], cachedSides=[], lastVideoTime=-1, dtms=16, AR=16/9;
+let useRVFC=false, detMs=0;
+
+/* Detection used to be polled from the render loop by watching currentTime,
+   so a decoded frame could sit unexamined for up to a full rAF interval.
+   requestVideoFrameCallback fires the moment a frame is actually available:
+   inference starts immediately and the render loop just consumes whatever is
+   freshest. Worth roughly half a frame of input lag on its own. */
+function detect(){
+  if(!landmarker || mode!=="cam" || vid.readyState<2) return;
+  const t0d=performance.now();
+  try{
+    const res=landmarker.detectForVideo(vid, t0d);
+    cachedHands=res.landmarks||[];
+    cachedSides=(res.handedness||[]).map(x=>{
+      const l=x[0]&&x[0].categoryName;      // label refers to the un-mirrored image
+      return l==="Left" ? "RIGHT" : l==="Right" ? "LEFT" : "?";
+    });
+  }catch(e){}
+  detMs = detMs*0.85 + (performance.now()-t0d)*0.15;
+}
+function pumpVideo(){
+  if(!vid.requestVideoFrameCallback) return false;
+  const step=()=>{ detect(); vid.requestVideoFrameCallback(step); };
+  vid.requestVideoFrameCallback(step);
+  return true;
+}
+const handStates=[new HandState("A"), new HandState("B")];
+const pairState={pair:PAIR.NONE, pairT:0, pairScore:0, corners:null, tilt:0};
+const toScreen=(p,fit)=>({ x:fit.ox+(p.x/AR)*fit.dw, y:fit.oy+p.y*fit.dh });
+
+/* MediaPipe's detection order isn't stable between frames, so indexing hands
+   by array position silently swaps their identities — which teleports both
+   centroids and, again, fakes huge velocities. Match each detection to the
+   slot whose last position is nearest instead. */
+function assignHands(raw){
+  const slots=[null,null], used=new Array(raw.length).fill(false);
+  for(let sl=0; sl<2; sl++){
+    const h=handStates[sl];
+    if(!h.lastRawC || h.lost>0.40) continue;
+    let bi=-1, bd=0.25;                        // cap on a believable jump
+    for(let i=0;i<raw.length;i++){
+      if(used[i]) continue;
+      const d=Math.hypot((raw[i][0].x+raw[i][9].x)/2 - h.lastRawC.x,
+                         (raw[i][0].y+raw[i][9].y)/2 - h.lastRawC.y);
+      if(d<bd){ bd=d; bi=i; }
+    }
+    if(bi>=0){ slots[sl]=bi; used[bi]=true; }
+  }
+  for(let i=0;i<raw.length;i++){                // fresh acquisitions
+    if(used[i]) continue;
+    const sl=slots.indexOf(null);
+    if(sl<0) break;
+    slots[sl]=i; used[i]=true; handStates[sl].reset();
+  }
+  return slots;
+}
+
+/* the camera feed OUTSIDE the terminals stays sharp */
+function drawBackground(fit){
+  if(mode==="cam" && vid.readyState>=2){
+    g.save(); g.scale(-1,1);
+    g.drawImage(vid, -(fit.ox+fit.dw), fit.oy, fit.dw, fit.dh);
+    g.restore();
+    g.fillStyle="rgba(4,7,10,0.30)"; g.fillRect(0,0,W,H);
+  } else {
+    g.fillStyle="#04070a"; g.fillRect(0,0,W,H);
+    g.strokeStyle="rgba(28,43,51,0.5)"; g.lineWidth=1;
+    g.beginPath();
+    for(let x=0;x<W;x+=64){ g.moveTo(x,0); g.lineTo(x,H); }
+    for(let y=0;y<H;y+=64){ g.moveTo(0,y); g.lineTo(W,y); }
+    g.stroke();
+  }
+}
+
+/* one small mosaic buffer per frame; each terminal clips its own window of it */
+function prepMosaic(fit){
+  mosReady=false;
+  if(mode!=="cam" || vid.readyState<2) return;
+  const sw=Math.max(2,Math.round(W/MOSAIC_PX)), sh=Math.max(2,Math.round(H/MOSAIC_PX));
+  if(mos.width!==sw||mos.height!==sh){ mos.width=sw; mos.height=sh; }
+  mosCtx.save(); mosCtx.scale(-1,1);
+  mosCtx.drawImage(vid, -(fit.ox+fit.dw)/MOSAIC_PX, fit.oy/MOSAIC_PX,
+                   fit.dw/MOSAIC_PX, fit.dh/MOSAIC_PX);
+  mosCtx.restore();
+  mosReady=true;
+}
+
+function drawHand(h, pts, tag, grabbing){
+  g.lineWidth=1;
+  g.strokeStyle = grabbing ? TERM.grab : (tag ? "rgba(53,224,192,0.7)" : "rgba(223,239,242,0.42)");
+  g.beginPath();
+  for(const [a,b] of BONES){ g.moveTo(pts[a].x,pts[a].y); g.lineTo(pts[b].x,pts[b].y); }
+  g.stroke();
+  for(let i=0;i<21;i++){
+    const p=pts[i];
+    if(TIPS.includes(i)){
+      g.shadowBlur=9; g.shadowColor= grabbing ? TERM.grab : "#dfeff2";
+      g.fillStyle= grabbing ? TERM.grab : "#ffffff";
+      g.beginPath(); g.arc(p.x,p.y,3,0,7); g.fill();
+      g.shadowBlur=0;
+    } else {
+      g.fillStyle= grabbing ? "rgba(124,255,160,0.85)" : "rgba(223,239,242,0.6)";
+      g.beginPath(); g.arc(p.x,p.y,1.6,0,7); g.fill();
+    }
+  }
+  const w=pts[0], sp=Math.hypot(pts[9].x-pts[0].x, pts[9].y-pts[0].y);
+  g.strokeStyle= grabbing ? "rgba(124,255,160,0.55)" : "rgba(53,224,192,0.45)";
+  g.beginPath(); g.arc(w.x,w.y,15,0,7); g.stroke();
+  g.beginPath(); g.moveTo(w.x,w.y);
+  g.lineTo(w.x+Math.cos(h.angle)*sp*1.25, w.y+Math.sin(h.angle)*sp*1.25);
+  g.stroke();
+  if(tag){
+    g.fillStyle= grabbing ? TERM.grab : "#35e0c0";
+    g.font="9px ui-monospace, monospace";
+    g.fillText(tag, pts[0].x+18, pts[0].y+4);
+  }
+}
+
+/* ── panel renderers. Each draws in the window's local space, already
+      clipped to the glass, with the mosaic backdrop and black fill under it. */
+function panelHead(w, label, sub){
+  const fs=clamp(w/42,8,13);
+  g.font=fs+"px ui-monospace, monospace";
+  g.fillStyle="rgba(255,255,255,0.88)";
+  g.fillText(label, 9, fs+7);
+  if(sub){
+    g.fillStyle="rgba(255,255,255,0.40)";
+    const sw=g.measureText(sub).width;
+    g.fillText(sub, Math.max(9+g.measureText(label).width+12, w-sw-9), fs+7);
+  }
+  return fs+16;
+}
+function readout(w, h, txt){
+  const fs=clamp(w/46,7,11);
+  g.font=fs+"px ui-monospace, monospace";
+  g.fillStyle="rgba(255,255,255,0.55)";
+  g.fillText(txt, 9, h-8);
+}
+const THERM=[[0,0,0],[26,10,64],[126,20,120],[224,68,52],[255,168,40],[255,255,224]];
+function thermal(v){
+  v=clamp(v,0,1)*(THERM.length-1);
+  const i=Math.min(THERM.length-2, v|0), f=v-i;
+  const a=THERM[i], b=THERM[i+1];
+  return `rgb(${(a[0]+(b[0]-a[0])*f)|0},${(a[1]+(b[1]-a[1])*f)|0},${(a[2]+(b[2]-a[2])*f)|0})`;
+}
+
+function drawVectorscope(w, h){
+  const top=panelHead(w,"VECTORSCOPE","BT.601");
+  const size=Math.min(w-18, h-top-20);
+  if(size<40){ readout(w,h,"too small"); return; }
+  const cx=w/2, cy=top+(h-top-14)/2, R=size/2;
+  g.strokeStyle="rgba(255,255,255,0.18)"; g.lineWidth=1;
+  g.beginPath(); g.arc(cx,cy,R,0,7); g.stroke();
+  g.beginPath(); g.arc(cx,cy,R*0.75,0,7); g.stroke();
+  g.beginPath(); g.moveTo(cx-R,cy); g.lineTo(cx+R,cy);
+  g.moveTo(cx,cy-R); g.lineTo(cx,cy+R); g.stroke();
+  // flesh-tone line — where skin lands on a correctly balanced image
+  g.strokeStyle="rgba(255,186,150,0.42)"; g.setLineDash([3,4]);
+  const fa=123*Math.PI/180;
+  g.beginPath(); g.moveTo(cx,cy); g.lineTo(cx+Math.cos(-fa)*R, cy+Math.sin(-fa)*R); g.stroke();
+  g.setLineDash([]);
+  // sample cloud
+  const step=(R*VS_SC)/VSN, half=step/2;
+  for(let i=0;i<vsCount.length;i++){
+    const n=vsCount[i]; if(!n) continue;
+    const gx=i%VSN, gy=(i/VSN)|0;
+    const U=(gx+0.5)/VSN-0.5, V=0.5-(gy+0.5)/VSN;
+    const x=cx+U*R*VS_SC, y=cy-V*R*VS_SC;
+    if(Math.hypot(x-cx,y-cy)>R*1.25) continue;
+    g.globalAlpha=clamp(0.18+0.9*Math.log(1+n)/Math.log(1+vsPeak),0,1);
+    g.fillStyle=`rgb(${(vsR[i]/n)|0},${(vsG[i]/n)|0},${(vsB[i]/n)|0})`;
+    g.fillRect(x-half,y-half,step,step);
+  }
+  g.globalAlpha=1;
+  // 75% targets
+  g.strokeStyle="rgba(255,255,255,0.55)"; g.lineWidth=1;
+  g.font="8px ui-monospace, monospace";
+  for(const t2 of VS_TARGETS){
+    const x=cx+t2.u*R*VS_SC, y=cy-t2.v*R*VS_SC;
+    g.strokeRect(x-4,y-4,8,8);
+    g.fillStyle="rgba(255,255,255,0.6)";
+    g.fillText(t2.k, x+6, y+3);
+  }
+  readout(w,h,`sat ${(vsSat*200).toFixed(0)}%   ${(vsCount.length)} bins`);
+}
+
+function drawMotion(w, h){
+  const top=panelHead(w,"MOTION",`${MCOLS}×${MROWS}`);
+  const gw=w-18, gh=h-top-20;
+  if(gw<30||gh<20){ readout(w,h,"too small"); return; }
+  const cw=gw/MCOLS, ch=gh/MROWS;
+  for(let y=0;y<MROWS;y++) for(let x=0;x<MCOLS;x++){
+    const v=motionE[y*MCOLS+x];
+    g.fillStyle=thermal(v);
+    g.fillRect(9+x*cw, top+y*ch, cw-1, ch-1);
+  }
+  g.strokeStyle="rgba(255,255,255,0.14)"; g.lineWidth=1;
+  g.strokeRect(9,top,gw,gh);
+  readout(w,h,`Δ ${(motionTotal*100).toFixed(1)}%   peak ${(motionPeak*100).toFixed(0)}%`);
+}
+
+function drawEdges(w, h){
+  const top=panelHead(w,"EDGES","sobel 3×3");
+  const gw=w-18, gh=h-top-20;
+  if(gw<30||gh<20||!edgeCv.width){ readout(w,h,"no frame"); return; }
+  g.save();
+  g.imageSmoothingEnabled=true;
+  g.globalAlpha=0.92;
+  g.drawImage(edgeCv, 9, top, gw, gh);
+  g.restore();
+  g.strokeStyle="rgba(255,255,255,0.14)"; g.lineWidth=1;
+  g.strokeRect(9,top,gw,gh);
+  readout(w,h,`density ${(edgeDensity*100).toFixed(1)}%   ${edgeCv.width}×${edgeCv.height}`);
+}
+
+function drawTextPanel(t, w, h, now){
+  const fs=clamp(w/58,9,17), pad=fs*0.85, lh=fs*1.30;
+  g.font=fs+"px ui-monospace, monospace";
+  const cw=g.measureText("M").width;
+  const rows=Math.max(1,Math.floor((h-pad*1.6)/lh));
+  const vis=t.log.slice(-rows);
+  vis.forEach((ln,i)=>{ g.fillStyle=ln.c; g.fillText(ln.s, pad, pad+(i+1)*lh); });
+  const last=vis[vis.length-1];
+  if((now%1000)<540){
+    g.fillStyle=TERM.fg;
+    g.fillRect(pad+((last?last.s.length:0)+1)*cw, pad+vis.length*lh-fs*0.82, cw*0.85, fs*0.95);
+  }
+}
+
+function drawTerminal(t, now){
+  if(t.open<0.01) return;
+  const r=t.r, o=t.open, hh=r.h*o;
+  const held = t.grabbedBy!==null;
+
+  g.save();
+  g.translate(r.x+r.w/2, r.y+r.h/2);
+  g.rotate(t.tilt);
+  g.translate(-r.w/2, -hh/2);
+
+  // clip to the window body — everything below is confined to the glass
+  g.beginPath(); g.rect(0,0,r.w,hh); g.clip();
+
+  // 1) mosaic backdrop, only inside this clip. The clip lives in device
+  //    space, so we can reset the transform, blit the full-screen mosaic
+  //    buffer, and only this window's slice of it lands.
+  if(mosaic && mosReady){
+    g.save();
+    g.setTransform(DPR,0,0,DPR,0,0);
+    g.imageSmoothingEnabled=false;
+    g.drawImage(mos, 0, 0, W, H);
+    g.restore();
+  }
+  // 2) black at 90% — the remaining 10% is that mosaic
+  g.globalAlpha=TERM.bgAlpha*Math.min(1,o*1.4);
+  g.fillStyle=TERM.bg;
+  g.fillRect(0,0,r.w,hh);
+  g.globalAlpha=1;
+
+  // 3) text, fully opaque
+  if(o>0.5){
+    const name=PANELS[t.feed];
+    if(name==="VSCOPE")      drawVectorscope(r.w, hh);
+    else if(name==="MOTION") drawMotion(r.w, hh);
+    else if(name==="EDGES")  drawEdges(r.w, hh);
+    else                     drawTextPanel(t, r.w, hh, now);
+  } else {
+    g.fillStyle=TERM.fg; g.fillRect(0, hh/2-1, r.w, 2);
+  }
+  g.restore();
+
+  // 4) border outside the clip so it isn't cut in half
+  g.save();
+  g.translate(r.x+r.w/2, r.y+r.h/2);
+  g.rotate(t.tilt);
+  g.translate(-r.w/2, -hh/2);
+  if(held){
+    g.shadowBlur=18; g.shadowColor=TERM.grab;
+    g.strokeStyle=TERM.grab; g.lineWidth=2.5;
+    g.strokeRect(1,1,r.w-2,hh-2);
+    g.shadowBlur=0;
+    const bl=Math.min(26,r.w*0.13);
+    g.lineWidth=3.5;
+    for(const [cx,cy,sx,sy] of [[0,0,1,1],[r.w,0,-1,1],[0,hh,1,-1],[r.w,hh,-1,-1]]){
+      g.beginPath();
+      g.moveTo(cx+sx*bl,cy); g.lineTo(cx,cy); g.lineTo(cx,cy+sy*bl);
+      g.stroke();
+    }
+  } else {
+    g.strokeStyle = t.id===activeId ? "rgba(255,255,255,0.85)"
+                  : t.docked ? "rgba(223,239,242,0.28)" : TERM.border;
+    g.lineWidth = t.id===activeId ? 2 : 1;
+    g.strokeRect(0.5,0.5,r.w-1,hh-1);
+  }
+  g.restore();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §8  INTERACTION
+   ═══════════════════════════════════════════════════════════════════════════ */
+let formingTerm = null;      // the terminal being sized by an active FRAME
+
+function applyPair(fit, dt, now){
+  if(pairState.pair===PAIR.CLEAR){
+    // Already holding a window? Then you're plainly not trying to clear —
+    // cancel the charge and hand control back to the single-hand gestures.
+    if(terms.some(t=>t.grabbedBy!==null)){ pairState.pairT=0; return false; }
+    if(pairState.pairT>=CLEAR_HOLD){
+      for(const t of terms){ t.closing=true; t.fling={x:0,y:-0.85}; }
+      pairState.pairT=0;
+    }
+    // Otherwise consume the frame: both hands open AND upright is specific
+    // enough that you mean it, and without this a window sitting under a
+    // raised palm gets grabbed and silently blocks the clear forever.
+    return true;
+  }
+  if(pairState.pair===PAIR.FRAME && pairState.corners){
+    const A=toScreen(pairState.corners[0],fit), B=toScreen(pairState.corners[1],fit);
+    const rect={ x:Math.min(A.x,B.x), y:Math.min(A.y,B.y),
+                 w:Math.abs(A.x-B.x), h:Math.abs(A.y-B.y) };
+    if(rect.w<MIN_W || rect.h<MIN_H) return;
+    if(!formingTerm){
+      formingTerm=new Terminal(rect, terms.length % PANELS.length);
+      terms.push(formingTerm); activeId=formingTerm.id;
+    }
+    formingTerm.lossT=0;
+    formingTerm.t=rect; formingTerm.tiltT=pairState.tilt;
+    formingTerm.target=1; formingTerm.closing=false;
+    // commit early and permanently — hands down no longer kills it
+    if(pairState.pairT>=COMMIT_HOLD && !formingTerm.committed){
+      formingTerm.committed=true;
+      formingTerm.touchedAt=now;
+      enforceLayout(now);
+    }
+    return true;
+  } else if(formingTerm){
+    // tolerate a brief dropout mid-formation rather than restarting the timer
+    formingTerm.lossT=(formingTerm.lossT||0)+dt;
+    if(formingTerm.lossT>0.25){
+      if(!formingTerm.committed){
+        const i=terms.indexOf(formingTerm);   // released before commit: a twitch
+        if(i>=0) terms.splice(i,1);
+      }
+      formingTerm=null;
+    }
+  }
+  return false;
+}
+
+function applySingle(h, other, fit, dt, now){
+  const p=toScreen(h.centroidM,fit);
+
+  /* ── grab / move / fling ──
+     v3 used a closed fist here. MediaPipe's landmark quality collapses on a
+     fist — the fingers occlude each other and there's nothing left to track —
+     so an open palm is the hold gesture now. Close or relax the hand to let
+     go; the window stays exactly where you dropped it. */
+  if(h.gest===G.OPEN_PALM){
+    let t=terms.find(x=>x.grabbedBy===h.id);
+    if(!t){
+      t=termAt(p);
+      if(t && t.grabbedBy===null){
+        t.grabbedBy=h.id;
+        t.touchedAt=now;
+        if(t.docked){ undock(t,p,now); enforceLayout(now); }   // pull it off the shelf
+        t.grabOff={ x:t.t.x-p.x, y:t.t.y-p.y };
+        t.sizeRef=null;
+        activeId=t.id;
+      }
+    }
+    if(t && t.grabbedBy===h.id){
+      // swipe hard in any direction → throw it off screen and close
+      if(h.speed>SWIPE_V && h.age>0.25 && !t.closing){
+        const v=norm(h.vel);
+        const dir = Math.abs(v.x)>Math.abs(v.y) ? {x:Math.sign(v.x),y:0} : {x:0,y:Math.sign(v.y)};
+        t.fling=dir; t.closing=true; t.grabbedBy=null;
+        return;
+      }
+      t.t={ x:p.x+t.grabOff.x, y:p.y+t.grabOff.y, w:t.t.w, h:t.t.h };
+      // the free hand's thumb-index gap scales it, measured relative to
+      // wherever that hand started so nothing jumps on acquisition
+      if(other){
+        const gap=other.f.pinch;
+        if(!t.sizeRef) t.sizeRef={ gap:Math.max(0.12,gap), w:t.t.w, h:t.t.h };
+        const k=clamp(Math.max(0.12,gap)/t.sizeRef.gap, 0.30, 3.2);
+        const w=clamp(t.sizeRef.w*k, MIN_W, W*0.94), hh=clamp(t.sizeRef.h*k, MIN_H, H*0.94);
+        const cx=t.t.x+t.t.w/2, cy=t.t.y+t.t.h/2;
+        t.t={ x:cx-w/2, y:cy-hh/2, w, h:hh };
+        t.grabOff={ x:t.t.x-p.x, y:t.t.y-p.y };
+      } else t.sizeRef=null;
+    }
+    return;
+  }
+  // hand no longer open → let go; the window stays where it was dropped
+  for(const t of terms) if(t.grabbedBy===h.id){ t.grabbedBy=null; t.sizeRef=null; }
+
+  // ── discrete actions ──
+  if(h.gest===G.PEACE){
+    if(h.candT>0.45 && !h._spawn){
+      h._spawn=true;
+      const nt=new Terminal({ x:clamp(p.x-DEFAULT_W/2,12,Math.max(12,W-DEFAULT_W-12)),
+                              y:clamp(p.y-DEFAULT_H/2,12,Math.max(12,H-DEFAULT_H-12)),
+                              w:DEFAULT_W, h:DEFAULT_H }, terms.length % PANELS.length);
+      nt.committed=true; nt.touchedAt=now;
+      terms.push(nt); activeId=nt.id;
+      enforceLayout(now);
+    }
+  } else h._spawn=false;
+
+  if(h.gest===G.POINT){
+    if(h.candT>0.5 && !h._cycle){
+      h._cycle=true;
+      const pool=terms.filter(x=>x.committed && !x.closing);
+      if(pool.length){
+        const i=pool.findIndex(x=>x.id===activeId);
+        const nx=pool[(i+1)%pool.length];
+        activeId=nx.id; nx.touchedAt=now;
+        // selecting a shelved card promotes it to the front of the cascade,
+        // so cycling can actually reach every card instead of just the newest
+        if(nx.docked){ nx.dockedAt=now; enforceLayout(now); }
+      }
+    }
+  } else h._cycle=false;
+
+  if(h.gest===G.THUMB_UP){
+    if(h.candT>0.5 && !h._feed){
+      h._feed=true;
+      const at=activeTerm();
+      if(at){ at.feed=(at.feed+1)%PANELS.length; at.log=[]; at.acc=1; }
+    }
+  } else h._feed=false;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §9  SIM
+   ═══════════════════════════════════════════════════════════════════════════ */
+const CANON=[[0,0],[-0.10,-0.08],[-0.20,-0.20],[-0.27,-0.30],[-0.33,-0.38],
+  [-0.06,-0.42],[-0.07,-0.60],[-0.08,-0.71],[-0.08,-0.80],
+  [0.02,-0.44],[0.03,-0.63],[0.03,-0.75],[0.03,-0.85],
+  [0.10,-0.42],[0.12,-0.59],[0.13,-0.70],[0.13,-0.79],
+  [0.17,-0.37],[0.20,-0.51],[0.22,-0.60],[0.23,-0.67]];
+const FLEX=[0.95,1.30,0.85];
+function synthHand(cx,cy,scale,rot,curls,flip,aspect,pinchAmt=0,abduct=0){
+  const pts=CANON.map(p=>[p[0],p[1]]);
+  CHAINS.forEach((chain,fi)=>{
+    const c=curls[fi];
+    if(c<=0.001) return;
+    let ang=0;
+    for(let k=1;k<chain.length;k++){
+      const i=chain[k], prev=chain[k-1];
+      const seg=[CANON[i][0]-CANON[prev][0], CANON[i][1]-CANON[prev][1]];
+      ang+=FLEX[k-1]*c;
+      const ca=Math.cos(ang), sa=Math.sin(ang);
+      pts[i]=[pts[prev][0]+ca*seg[0]-sa*seg[1], pts[prev][1]+sa*seg[0]+ca*seg[1]];
+    }
+  });
+  if(abduct>0){
+    const a=-abduct*0.85, ca=Math.cos(a), sa=Math.sin(a);
+    for(const i of [2,3,4]){
+      const dx=pts[i][0]-pts[1][0], dy=pts[i][1]-pts[1][1];
+      pts[i]=[pts[1][0]+ca*dx-sa*dy, pts[1][1]+sa*dx+ca*dy];
+    }
+  }
+  if(pinchAmt>0){
+    for(const i of [3,4]){
+      pts[i][0]=lerp(pts[i][0],pts[8][0],pinchAmt*0.92);
+      pts[i][1]=lerp(pts[i][1],pts[8][1],pinchAmt*0.92);
+    }
+  }
+  const cr=Math.cos(rot), sr=Math.sin(rot);
+  return pts.map(([x,y],i)=>{
+    if(flip) x=-x;
+    return { x:cx+(cr*x-sr*y)*scale/aspect, y:cy+(sr*x+cr*y)*scale, z:0.02*Math.sin(i*0.7) };
+  });
+}
+const CURL={
+  idle:[0.10,0.12,0.12,0.14,0.16], frame:[0.00,0.00,1.00,1.00,1.00],
+  fist:[0.95,0.98,0.98,0.98,0.98], open:[0.05,0.05,0.05,0.06,0.08],
+  pinch:[0.10,0.15,0.95,0.95,0.95], peace:[0.90,0.02,0.04,0.95,0.95],
+};
+/* 0-3 idle · 3-8 frame(create) · 8-10 hands down (it survives) ·
+   10-15 open-palm grab + drag · 15-20 second hand resizes · 20-21 release ·
+   21-27 four PEACE spawns, pushing past MAX_ACTIVE onto the shelf ·
+   27-33.5 both hands up (5s charge) → clear · 33.5-37 idle */
+function simHands(time, aspect){
+  const c=time%37;
+  const H1=(curls,cx,cy,rot,ab=0,pinch=0)=>synthHand(cx,cy,0.30,rot,curls,true,aspect,pinch,ab);
+  if(c<3)  return [H1(CURL.idle,0.50,0.55,-0.25)];
+  if(c<8)  return [H1(CURL.frame,0.26,0.28,Math.PI/2,1.0),
+                   H1(CURL.frame,0.74,0.72,-Math.PI/2,1.0)];
+  if(c<10) return [];
+  if(c<15){ const k=(c-10)/5; return [H1(CURL.open,0.50+0.14*k,0.50-0.08*k,-0.25,0.5)]; }
+  if(c<20){ const k=(c-15)/5;
+            return [H1(CURL.open,0.64,0.42,-0.25,0.5),
+                    H1(CURL.pinch,0.28,0.62,-0.25,0, k<0.5?k*2:(1-k)*2)]; }
+  if(c<21) return [H1(CURL.fist,0.64,0.42,-0.25)];
+  if(c<27){ const ph=(c-21)/1.5, seg=Math.floor(ph), x=0.28+0.13*seg;
+            return (ph-seg)<0.75 ? [H1(CURL.peace,x,0.62,-0.25)]
+                                 : [H1(CURL.fist,x,0.62,-0.25)]; }
+  if(c<33.5) return [H1(CURL.open,0.34,0.44,0,0.5), H1(CURL.open,0.66,0.44,0,0.5)];
+  return [H1(CURL.idle,0.50,0.55,-0.25)];
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §10  MAIN LOOP
+   ═══════════════════════════════════════════════════════════════════════════ */
+let prev=performance.now(), fpsAcc=0, fpsN=0, fps=0, layoutDirty=false;
+const t0=prev;
+
+function loop(){
+  const now=performance.now();
+  const dt=clamp((now-prev)/1000,0.001,0.05);
+  dtms=now-prev; prev=now;
+  const time=(now-t0)/1000;
+  fpsAcc+=1/dt; fpsN++;
+  if(fpsN>=20){ fps=fpsAcc/fpsN; fpsAcc=0; fpsN=0; $("tFps").textContent=fps.toFixed(0); }
+
+  g.setTransform(DPR,0,0,DPR,0,0);
+
+  let fit={ox:0,oy:0,dw:W,dh:H}, mirror=false, raw=[], sides=[];
+  if(mode==="cam" && vid.readyState>=2){
+    const vw=vid.videoWidth, vh=vid.videoHeight;
+    const sc=Math.max(W/vw,H/vh), dw=vw*sc, dh=vh*sc;
+    fit={ox:(W-dw)/2, oy:(H-dh)/2, dw, dh}; mirror=true; AR=vw/vh;
+    // polling remains only as a fallback where rVFC is unavailable
+    if(!useRVFC && landmarker && vid.currentTime!==lastVideoTime){
+      lastVideoTime=vid.currentTime; detect();
+    }
+    raw=cachedHands; sides=cachedSides;
+  } else {
+    AR=W/H; raw=simHands(time,AR); sides=raw.map((_,i)=>i?"LEFT":"RIGHT");
+  }
+
+  const hands=[];
+  const slots=assignHands(raw);
+  for(let sl=0; sl<2; sl++){
+    if(slots[sl]===null){ handStates[sl].lost+=dt; continue; }
+    const h=handStates[sl];
+    h.update(raw[slots[sl]],dt,mirror,AR,sides[slots[sl]]||"?");
+    classifySingle(h,dt);
+    hands.push(h);
+  }
+
+  classifyPair(hands,dt,pairState);
+  const consumed=applyPair(fit,dt,now);
+  if(!consumed){
+    for(let i=0;i<hands.length;i++) applySingle(hands[i], hands[1-i]||null, fit, dt, now);
+  }
+
+  // fan the folder open when a hand approaches it, or when a card is selected
+  {
+    const q=folderGeom();
+    const near=hands.some(h=>{
+      const p=toScreen(h.centroidM,fit);
+      return p.x>q.fx-190 && p.x<q.fx+q.fw+90 && p.y>q.fy-90 && p.y<q.fy+q.fh+190;
+    });
+    const held=terms.some(t=>t.docked && (t.id===activeId || t.grabbedBy!==null));
+    folderFan=lerp(folderFan, (near||held)?1:0, Math.min(1, dt*7));
+    for(const t of terms) if(t.docked && t.grabbedBy===null) t.t=dockRect(t.dockSlot);
+  }
+
+  for(let i=terms.length-1;i>=0;i--){
+    const t=terms[i];
+    t.step(dt);
+    if(t.open>0.5 && PANELS[t.feed]==="TRACK"){
+      t.acc+=dt;
+      if(t.acc>0.12){ t.acc=0; for(const ln of feedLines(t,hands,pairState.pair,time)) t.push(ln); }
+    }
+    const gone = t.r.x>W+80 || t.r.x+t.r.w<-80 || t.r.y>H+80 || t.r.y+t.r.h<-80;
+    if((t.closing && t.open<0.02) || (t.fling && gone)){
+      terms.splice(i,1);
+      if(activeId===t.id) activeId=terms.length?terms[terms.length-1].id:null;
+      if(formingTerm===t) formingTerm=null;
+      layoutDirty=true;
+    }
+  }
+  if(layoutDirty){ layoutDirty=false; enforceLayout(now); }
+
+  // ── render ──
+  drawBackground(fit);
+  prepMosaic(fit);
+  // only pay for image analysis when a scope is actually on screen
+  if(terms.some(t=>t.open>0.4 && PANELS[t.feed]!=="TRACK")){
+    prepProc(fit, time);
+    analyze(dt);
+  }
+
+  const grabbing=new Set(terms.filter(t=>t.grabbedBy!==null).map(t=>t.grabbedBy));
+  if(showSkel){
+    for(const h of hands){
+      if(grabbing.has(h.id)) continue;     // grabbing hands draw on top, below
+      drawHand(h, h.m.map(p=>toScreen(p,fit)), h.gest===G.NONE?null:h.gest, false);
+    }
+    if(pairState.pair===PAIR.FRAME && pairState.corners){
+      const A=toScreen(pairState.corners[0],fit), B=toScreen(pairState.corners[1],fit);
+      g.strokeStyle="rgba(53,224,192,0.35)"; g.lineWidth=1; g.setLineDash([5,5]);
+      g.strokeRect(Math.min(A.x,B.x),Math.min(A.y,B.y),Math.abs(A.x-B.x),Math.abs(A.y-B.y));
+      g.setLineDash([]);
+    }
+  }
+  for(const t of terms) if(!t.docked) drawTerminal(t,now);
+
+  // folder chrome, then the cascade on top of it, back card first
+  const shelved=terms.filter(t=>t.docked && !t.closing);
+  if(shelved.length){
+    const q=folderGeom();
+    g.fillStyle="rgba(9,16,20,0.72)";
+    g.fillRect(q.fx,q.fy,q.fw,q.fh);
+    g.strokeStyle="rgba(223,239,242,0.22)"; g.lineWidth=1;
+    g.strokeRect(q.fx+0.5,q.fy+0.5,q.fw-1,q.fh-1);
+    g.fillStyle="rgba(223,239,242,0.10)";           // header strip
+    g.fillRect(q.fx+1,q.fy+1,q.fw-2,q.head-1);
+    g.fillStyle="rgba(223,239,242,0.72)";
+    g.font="10px ui-monospace, monospace";
+    g.fillText(folderFan>0.5 ? "▤  SHELF — open palm to pull one out" : "▤  SHELF",
+               q.fx+9, q.fy+14);
+    g.fillStyle="rgba(223,239,242,0.45)";
+    g.fillText(shelved.length+" / "+MAX_DOCK, q.fx+q.fw-46, q.fy+14);
+  }
+  for(const t of terms.filter(t=>t.docked).sort((a,b)=>b.dockSlot-a.dockSlot))
+    drawTerminal(t,now);
+  // clear-all charge meter
+  if(pairState.pair===PAIR.CLEAR && terms.length && !terms.some(t=>t.grabbedBy!==null)){
+    const k=clamp(pairState.pairT/CLEAR_HOLD,0,1);
+    const bw=Math.min(360,W*0.3);
+    g.fillStyle="rgba(4,7,10,0.75)"; g.fillRect(W/2-bw/2-8, H-64, bw+16, 30);
+    g.fillStyle="#ffffff"; g.font="10px ui-monospace, monospace";
+    g.fillText("CLEAR WORKSPACE  "+(CLEAR_HOLD-pairState.pairT).toFixed(1)+"s", W/2-bw/2, H-48);
+    g.fillStyle="rgba(255,255,255,0.25)"; g.fillRect(W/2-bw/2, H-44, bw, 4);
+    g.fillStyle="#7cffa0"; g.fillRect(W/2-bw/2, H-44, bw*k, 4);
+  }
+  // a grabbing hand sits behind the glass, so redraw it over the top
+  if(showSkel) for(const h of hands){
+    if(grabbing.has(h.id)) drawHand(h, h.m.map(p=>toScreen(p,fit)), "GRAB", true);
+  }
+
+  $("tHands").textContent=hands.length;
+  $("tL").textContent=hands[0]?`${hands[0].side} ${hands[0].gest}`:"—";
+  $("tR").textContent=hands[1]?`${hands[1].side} ${hands[1].gest}`:"—";
+  $("tPair").textContent=pairState.pair;
+  const gt=terms.find(t=>t.grabbedBy!==null);
+  $("tGrab").textContent= gt ? `#${gt.id} ${Math.round(gt.r.w)}×${Math.round(gt.r.h)}` : "—";
+  $("tConf").style.transform="scaleX("+(hands[0]?hands[0].gestScore:0).toFixed(2)+")";
+  $("tTerms").textContent=terms.length;
+  $("tLayout").textContent=terms.filter(t=>!t.docked&&!t.closing).length+" free / "+
+                            terms.filter(t=>t.docked&&!t.closing).length+" shelved";
+
+  requestAnimationFrame(loop);
+}
+loop();
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   §11  CONTROLS
+   ═══════════════════════════════════════════════════════════════════════════ */
+const status=$("status");
+function sync(){
+  $("bCam").classList.toggle("on",mode==="cam");
+  $("bSim").classList.toggle("on",mode==="sim");
+  $("bSkel").classList.toggle("on",showSkel);
+  $("bMosaic").classList.toggle("on",mosaic);
+}
+sync();
+
+async function startCam(){
+  status.textContent="loading model …";
+  try{
+    const mp=await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14");
+    const files=await mp.FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    landmarker=await mp.HandLandmarker.createFromOptions(files,{
+      baseOptions:{
+        modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate:"GPU" },
+      runningMode:"VIDEO", numHands:2,
+      minHandDetectionConfidence:TUNE.detConf, minTrackingConfidence:TUNE.trkConf });
+  }catch(e){
+    status.textContent="couldn't load the model — needs internet and http://localhost (not file://). Staying in SIM.";
+    return;
+  }
+  try{
+    const st=await navigator.mediaDevices.getUserMedia({
+      video:{ width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:60}, facingMode:"user" }, audio:false });
+    vid.srcObject=st; await vid.play();
+    useRVFC=pumpVideo();
+  }catch(e){
+    status.textContent="camera blocked — serve this folder over http://localhost and allow access. Staying in SIM.";
+    return;
+  }
+  mode="cam"; cachedHands=[]; sync();
+  const trk=vid.srcObject.getVideoTracks()[0], cs=trk?trk.getSettings():{};
+  status.textContent=`camera live · ${cs.width||"?"}×${cs.height||"?"} @${Math.round(cs.frameRate||0)}fps`
+    + (useRVFC ? " · frame-synced" : " · polled");
+}
+$("bCam").onclick=()=>{ if(mode!=="cam") startCam(); };
+$("bSim").onclick=()=>{
+  mode="sim";
+  if(vid.srcObject){ vid.srcObject.getTracks().forEach(t=>t.stop()); vid.srcObject=null; }
+  cachedHands=[]; sync();
+  status.textContent="running SIM — scripted hands, no camera needed.";
+};
+$("bSkel").onclick=()=>{ showSkel=!showSkel; sync(); };
+$("bMosaic").onclick=()=>{ mosaic=!mosaic; sync(); };
+$("bClear").onclick=()=>{ terms.length=0; formingTerm=null; activeId=null; };
+$("bFeed").onclick=()=>{
+  const at=activeTerm();
+  if(at){ at.feed=(at.feed+1)%PANELS.length; at.log=[]; at.acc=1; }
+};
+</script>
+</body>
+</html>
